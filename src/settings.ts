@@ -20,6 +20,8 @@ export interface HybridSearchSettings {
   defaultSearchFilters: string;
   customPostfixes: CustomPostfix[];
   showMeta: boolean;
+  /** Developer view: ranking scores and the chosen passage under each result. */
+  showSearchDiagnostics: boolean;
   showPreviewMeta: boolean;
   centerPanels: boolean;
   showPreview: boolean;
@@ -56,6 +58,7 @@ export const DEFAULT_SETTINGS: HybridSearchSettings = {
   defaultSearchFilters: '',
   customPostfixes: [],
   showMeta: false,
+  showSearchDiagnostics: false,
   showPreviewMeta: true,
   centerPanels: false,
   showPreview: true,
@@ -423,6 +426,18 @@ export class HybridSearchSettingTab extends PluginSettingTab {
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.showMeta).onChange(async (value) => {
           this.plugin.settings.showMeta = value;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(displayEl)
+      .setName('Show search diagnostics')
+      .setDesc(
+        'Show ranking scores and which passage was chosen for each result. Scores only order results; they are not confidence percentages.',
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.showSearchDiagnostics).onChange(async (value) => {
+          this.plugin.settings.showSearchDiagnostics = value;
           await this.plugin.saveSettings();
         }),
       );

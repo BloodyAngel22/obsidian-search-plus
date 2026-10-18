@@ -20,13 +20,22 @@ import { describeResults } from './filters/resultStatus';
 import { GraphPanel } from './GraphPanel';
 import { hookInternalLinks } from './linkHandler';
 import { registerModalKeymap } from './modalKeymap';
-import { openResultAtAnchor, type OpenResultOptions } from './navigation/openResult';
-import { getResultContext, renderResultContext } from './navigation/resultContext';
+import { resolveAnchorTarget } from './navigation/anchorResolver';
+import {
+  findRenderedBlock,
+  openResultAtAnchor,
+  type OpenResultOptions,
+} from './navigation/openResult';
+import {
+  getResultContext,
+  renderDiagnostics,
+  renderResultContext,
+  rowHighlightWords,
+} from './navigation/resultContext';
 import {
   applySuperchargedLinkAttributes,
   createInternalLink,
   fetchSimilarNotesDetailed,
-  getAnchorOffset,
   getResultTitle,
   hookSuperchargedLinks,
   modeLabel,
@@ -120,6 +129,7 @@ export class SearchModal extends SuggestModal<SearchResult> {
 
   open(): void {
     super.open();
+    this.modalEl.addClass('search-plus-modal');
     this.injectModeBadge();
     this.injectFilterBar();
     this.hookSuperchargedLinks();
@@ -220,110 +230,6 @@ export class SearchModal extends SuggestModal<SearchResult> {
     for (const span of Array.from(this.previewEl.querySelectorAll('.hybrid-search-word-match'))) {
       span.replaceWith(activeDocument.createTextNode(span.textContent ?? ''));
     }
-  }
-
-  private findHeadingElement(headingPath: string | null): HTMLElement | undefined {
-    if (!this.previewEl || !headingPath) return undefined;
-    const leaf = headingPath.split(' > ').pop()?.trim().toLowerCase();
-    if (!leaf) return undefined;
-    const headings = Array.from(this.previewEl.querySelectorAll('h1, h2, h3, h4, h5, h6')).filter(
-      (h) => !h.closest('.callout'),
-    );
-    return headings.find((h) => (h.textContent ?? '').trim().toLowerCase() === leaf) as
-      | HTMLElement
-      | undefined;
-  }
-
-  private getHeadingSiblings(headingEl: HTMLElement): Element[] {
-    const level = parseInt(headingEl.tagName[1]!, 10); // H3 → 3
-    const parent = headingEl.parentElement;
-    if (!parent) return [];
-    const siblings: Element[] = [];
-    let found = false;
-    for (const child of parent.children) {
-      if (child === headingEl) {
-        found = true;
-        continue;
-      }
-      if (!found) continue;
-      const m = /^H([1-6])$/.exec(child.tagName);
-      if (m && parseInt(m[1]!, 10) <= level) break;
-      siblings.push(child);
-    }
-    return siblings;
-  }
-
-  private findAnchorBlock(anchor: MatchAnchor): HTMLElement | undefined {
-    if (!this.previewEl) return undefined;
-    const headingEl = this.findHeadingElement(anchor.headingPath);
-    const region: Element[] = headingEl
-      ? [headingEl, ...this.getHeadingSiblings(headingEl)]
-      : Array.from(
-          this.previewEl.querySelectorAll('p, li, h1, h2, h3, h4, h5, h6, blockquote'),
-        ).filter((b) => !b.closest('.callout'));
-
-    if (!anchor.matchText) return headingEl;
-
-    const needle = anchor.matchText.toLowerCase();
-    const blockSel = 'p, li, h1, h2, h3, h4, h5, h6, blockquote';
-    const matches: HTMLElement[] = [];
-
-    for (const el of region) {
-      if (el.closest('.callout')) continue;
-      if (el.matches(blockSel) && (el.textContent ?? '').toLowerCase().includes(needle)) {
-        matches.push(el as HTMLElement);
-      }
-      // Check nested blocks inside container elements (e.g. div.callout excluded above)
-      for (const nested of el.querySelectorAll(blockSel)) {
-        if ((nested.textContent ?? '').toLowerCase().includes(needle)) {
-          matches.push(nested as HTMLElement);
-        }
-      }
-    }
-    if (matches.length > 0) return this.pickClosestByOffset(matches, anchor);
-
-    // Fallback A: search inside callout titles and content (for notes whose content is entirely callout blocks)
-    for (const titleEl of this.previewEl.querySelectorAll('.callout-title-inner')) {
-      if ((titleEl.textContent ?? '').toLowerCase().includes(needle)) return titleEl as HTMLElement;
-    }
-    for (const contentEl of this.previewEl.querySelectorAll('.callout-content p')) {
-      if ((contentEl.textContent ?? '').toLowerCase().includes(needle))
-        return contentEl as HTMLElement;
-    }
-    // Fallback B: heading element itself
-    return headingEl;
-  }
-
-  /** Multiple rendered blocks can contain the same matchText (repeated phrasing across a note).
-   *  Use the anchor's real source offset — validated via the same getAnchorOffset the search
-   *  panel/graph workbench use for cursor positioning — to pick the occurrence actually meant,
-   *  instead of always taking the first DOM match. */
-  private pickClosestByOffset(matches: HTMLElement[], anchor: MatchAnchor): HTMLElement {
-    if (matches.length === 1 || !this.previewEl || !this.currentPreviewContent) return matches[0]!;
-
-    const offset = getAnchorOffset(this.currentPreviewContent, anchor);
-    if (offset < 0) return matches[0]!;
-    const targetFraction = offset / this.currentPreviewContent.length;
-
-    const allBlocks = Array.from(
-      this.previewEl.querySelectorAll('p, li, h1, h2, h3, h4, h5, h6, blockquote'),
-    ).filter((b) => !b.closest('.callout'));
-    const totalLength = this.previewEl.textContent?.length || 1;
-
-    let best = matches[0]!;
-    let bestDiff = Infinity;
-    let consumed = 0;
-    for (const block of allBlocks) {
-      if (matches.includes(block as HTMLElement)) {
-        const diff = Math.abs(consumed / totalLength - targetFraction);
-        if (diff < bestDiff) {
-          bestDiff = diff;
-          best = block as HTMLElement;
-        }
-      }
-      consumed += (block.textContent ?? '').length;
-    }
-    return best;
   }
 
   triggerPreview(
@@ -525,6 +431,8 @@ export class SearchModal extends SuggestModal<SearchResult> {
     const result = await fetchSimilarNotesDetailed(this.client, path, {
       limit: this.settings.similarNotesBottomLimit,
       threshold: this.settings.similarNotesThreshold,
+      // Row snippets are shown only when they match the primary anchor.
+      anchors: true,
     });
     this.isRecentMode = result.scoreMode === 'structural';
     return result.results;
@@ -564,7 +472,10 @@ export class SearchModal extends SuggestModal<SearchResult> {
       'hybrid-search-name',
     );
 
-    if (!this.isRecentMode && !this.hideScores) {
+    // Scores only order results (they are not confidence), so they are part of the
+    // optional diagnostics view rather than every row.
+    const diagnostics = this.settings.showSearchDiagnostics && !this.isRecentMode;
+    if (diagnostics && !this.hideScores) {
       titleRow.createSpan({
         text: score.toFixed(2),
         cls: 'hybrid-search-score',
@@ -576,9 +487,10 @@ export class SearchModal extends SuggestModal<SearchResult> {
       renderResultContext(
         container,
         getResultContext(result),
-        this.currentMode === 'fulltext' ? this.currentQueryWords : null,
+        rowHighlightWords(result, this.currentMode, this.currentQueryWords),
       );
     }
+    if (diagnostics) renderDiagnostics(container, result);
 
     if (this.settings.showMeta) {
       const folder = result.path.includes('/') ? result.path.replace(/\/[^/]+$/, '') : '';
@@ -826,8 +738,10 @@ export class SearchModal extends SuggestModal<SearchResult> {
     }
   }
 
-  private highlightQueryWordsInRegion(elements: Element[]): void {
-    const words = this.currentQueryWords;
+  private highlightQueryWordsInRegion(
+    elements: Element[],
+    words: readonly string[] = this.currentQueryWords,
+  ): void {
     if (words.length === 0) return;
     const pattern = new RegExp(`(${words.map(escapeRegExp).join('|')})`, 'gi');
 
@@ -858,42 +772,34 @@ export class SearchModal extends SuggestModal<SearchResult> {
     }
   }
 
+  /**
+   * Preview the passage that opening the result navigates to: the primary anchor is
+   * resolved against the previewed text with the same resolver navigation uses, then
+   * its rendered block is marked. A stale or ambiguous anchor marks nothing; secondary
+   * anchors are never marked, so the accent always means "this is where Enter goes".
+   */
   private applyAnchorHighlight(anchors: MatchAnchor[], primaryIdx: number): void {
     const mode = this.currentMode;
-    if (mode === 'title') return;
-    if (!this.previewEl) return;
-
-    const collectedBlocks: Array<{ el: HTMLElement; isPrimary: boolean }> = [];
-    const highlightRegions: Element[] = [];
-
-    for (let i = 0; i < anchors.length; i++) {
-      const anchor = anchors[i]!;
-      const block = this.findAnchorBlock(anchor);
-      if (!block) continue;
-
-      const isPrimary = i === primaryIdx;
-      // Only the primary anchor's block gets the "this is the match" accent — a secondary
-      // (e.g. bm25) anchor pointing at unrelated text would otherwise show an identical
-      // accent next to it with nothing to distinguish which one is actually scrolled to.
-      if (isPrimary) block.classList.add('hybrid-search-semantic-match');
-      collectedBlocks.push({ el: block, isPrimary });
-
-      const headingEl = this.findHeadingElement(anchor.headingPath);
-      if (headingEl) {
-        highlightRegions.push(headingEl, ...this.getHeadingSiblings(headingEl));
-      } else {
-        highlightRegions.push(block);
-      }
-    }
-
-    if (mode !== 'semantic' && this.currentQueryWords.length > 0) {
+    const content = this.currentPreviewContent;
+    if (mode === 'title' || !this.previewEl || content === undefined) return;
+    const anchor = anchors[primaryIdx] ?? anchors[0];
+    if (!anchor) return;
+    const target = resolveAnchorTarget(content, anchor, {
+      queryWords: this.currentQueryWords,
+      highlightExact: mode !== 'semantic',
+    });
+    if (!target) return;
+    const block = findRenderedBlock(this.previewEl, content, target, 'position');
+    if (!block) return;
+    block.classList.add('hybrid-search-semantic-match');
+    // Only verified literal evidence is marked, and only inside the passage.
+    if (target.highlight) {
       this.highlightQueryWordsInRegion(
-        highlightRegions.length > 0 ? highlightRegions : [this.previewEl],
+        [block],
+        [content.slice(target.highlight.start, target.highlight.end).toLowerCase()],
       );
     }
-
-    const primary = collectedBlocks.find((b) => b.isPrimary) ?? collectedBlocks[0];
-    if (primary) this.scheduleSnippetScroll(primary.el);
+    this.scheduleSnippetScroll(block);
   }
 
   private updatePreviewMeta(nfcPath: string): void {

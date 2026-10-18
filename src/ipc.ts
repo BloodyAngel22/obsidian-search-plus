@@ -13,6 +13,15 @@ export interface MatchAnchor {
   matchText: string;
   charStart: number | null;
   charEnd: number | null;
+  /**
+   * Newer engines: body-relative offsets of a verified exact hit (the FTS hit, or the
+   * whole identifier inside a hybrid semantic passage).
+   */
+  matchStart?: number;
+  matchEnd?: number;
+  /** Newer engines: body-relative bounds of the selected passage (one Markdown block). */
+  passageStart?: number;
+  passageEnd?: number;
 }
 
 export interface SearchResult {
@@ -38,6 +47,8 @@ export interface SearchResult {
   };
   previewAnchors?: MatchAnchor[];
   primaryAnchorIndex?: number;
+  /** Newer engines: where the snippet came from (the primary passage, or the note opening). */
+  snippetSource?: 'bm25' | 'semantic' | 'intro';
 }
 
 export interface SearchOptions {

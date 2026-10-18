@@ -3,6 +3,7 @@
  * Only stubs what the plugin actually uses — extend as needed.
  * The real `obsidian` package is provided by the Obsidian runtime, not Node.js.
  */
+import { StateField } from '@codemirror/state';
 import { vi } from 'vitest';
 
 export function parseLinktext(linktext: string): { path: string; subpath: string } {
@@ -601,3 +602,10 @@ export const debounce = <T extends unknown[]>(
   fn.cancel = () => {};
   return fn;
 };
+
+/** Same role as Obsidian's editorInfoField: which view/file an editor belongs to.
+ * Tests provide it with `editorInfoField.init(() => view)`. */
+export const editorInfoField = StateField.define<unknown>({
+  create: () => null,
+  update: (value) => value,
+});

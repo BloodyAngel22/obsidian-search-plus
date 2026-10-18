@@ -719,11 +719,6 @@ li.hybrid-search-semantic-match {
   cursor: pointer;
 }
 
-.hybrid-search-panel-row:hover,
-.hybrid-search-panel-row.is-selected {
-  background: var(--background-modifier-hover);
-}
-
 .hybrid-search-panel-link {
   color: var(--text-normal);
   text-decoration: none;
@@ -2055,19 +2050,40 @@ li.hybrid-search-semantic-match {
   color: var(--text-normal);
 }
 
-/* ── Result context and navigation ─────────────────────────────────────────── */
+/* ── Result rows: title → heading path → passage snippet ──────────────────── */
+
+/* Selection stays visible (accent bar) without a heavy background block. */
+.search-plus-modal .suggestion-item.is-selected,
+.hybrid-search-panel-result.is-selected {
+  background-color: color-mix(in srgb, var(--background-modifier-hover) 60%, transparent);
+  box-shadow: inset 2px 0 0 var(--interactive-accent);
+}
+
+.search-plus-modal .suggestion-item {
+  padding-top: var(--size-4-1, 4px);
+  padding-bottom: var(--size-4-1, 4px);
+}
+
+.search-plus-modal .hybrid-search-result .hybrid-search-name {
+  color: var(--text-normal);
+  font-weight: var(--font-medium, 500);
+}
 
 .search-plus-result-context {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
   min-width: 0;
-  margin-top: 1px;
+  margin-top: 2px;
 }
 
 .search-plus-result-heading {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--text-accent);
+  color: var(--text-muted);
   font-size: var(--font-ui-smaller, 12px);
+  font-weight: var(--font-medium, 500);
 }
 
 .search-plus-result-snippet {
@@ -2075,27 +2091,93 @@ li.hybrid-search-semantic-match {
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
   overflow: hidden;
+  overflow-wrap: anywhere;
   color: var(--text-muted);
-  font-size: var(--font-ui-smaller, 12px);
-  line-height: var(--line-height-tight, 1.3);
+  font-size: var(--font-ui-small, 13px);
+  line-height: 1.45;
 }
 
 .search-plus-result-hit {
   color: var(--text-normal);
   background-color: var(--text-highlight-bg);
   border-radius: 2px;
+  padding: 0 1px;
 }
 
-.hybrid-search-panel-heading {
-  padding: 0 6px 1px 28px;
+/* Optional diagnostics view (Settings → Display → Show search diagnostics). */
+.search-plus-result-diagnostics {
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller, 12px);
+}
+
+/* Panel: the whole result is the target, not only its title line. Obsidian gives a
+   selected tree row its own strong background; the result item carries selection. */
+.hybrid-search-panel-result {
+  border-radius: var(--radius-s, 4px);
+}
+
+.hybrid-search-panel-row.tree-item-self.is-selected,
+.hybrid-search-panel-row.tree-item-self:hover {
+  background-color: transparent;
+}
+
+.hybrid-search-panel-result:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+.hybrid-search-panel-context {
+  padding: 0 var(--size-4-2, 8px) var(--size-4-1, 4px) 28px;
+}
+
+.hybrid-search-panel-snippet {
+  font-size: var(--font-ui-small, 13px);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 /* Reading view: the passage a result opened at, for a moment. */
 .search-plus-nav-flash {
   border-radius: var(--radius-s, 4px);
-  background-color: var(--text-highlight-bg);
-  box-shadow: 0 0 0 4px var(--text-highlight-bg);
+  background-color: color-mix(in srgb, var(--interactive-accent) 12%, transparent);
+  box-shadow:
+    inset 2px 0 0 var(--interactive-accent),
+    0 0 0 4px color-mix(in srgb, var(--interactive-accent) 12%, transparent);
   transition:
     background-color 400ms ease,
     box-shadow 400ms ease;
+}
+
+/* Source mode / Live Preview: temporary markers from the editor extension. They fade
+   out on their own; the decoration is removed after the same time. Theme colors only. */
+.search-plus-nav-hit {
+  border-radius: 2px;
+  background-color: var(--text-highlight-bg);
+  animation: search-plus-nav-fade 2s ease-in forwards;
+}
+
+.cm-line.search-plus-nav-passage {
+  background-color: color-mix(in srgb, var(--interactive-accent) 10%, transparent);
+  box-shadow: inset 2px 0 0 var(--interactive-accent);
+  animation: search-plus-nav-fade 2s ease-in forwards;
+}
+
+@keyframes search-plus-nav-fade {
+  0%,
+  60% {
+    opacity: 1;
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .search-plus-nav-hit,
+  .cm-line.search-plus-nav-passage {
+    animation: none;
+  }
 }

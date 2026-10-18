@@ -11,6 +11,9 @@ import type { MatchAnchor } from '../../ipc';
  *   characters: the first body line for semantic anchors, the line holding the FTS
  *   hit for BM25 anchors.
  * - `headingPath` is the chunk's raw heading lines joined with " > ".
+ * - Newer engines narrow the chunk to one passage (`passageStart`/`passageEnd`, same
+ *   coordinates): it starts at a line start, and `matchText` is then its first line
+ *   (semantic) or the hit line inside it (BM25).
  * - Chunks indexed by older engines have null offsets.
  *
  * Nothing here trusts an offset blindly: a position is returned only when the text at
@@ -19,8 +22,14 @@ import type { MatchAnchor } from '../../ipc';
  */
 
 type AnchorConfidence =
+  /** The engine's selected passage is still where its offsets say. */
+  | 'passage'
+  /** The engine's exact hit offsets (BM25 `matchStart`) still point at the matched line. */
+  | 'exact'
   /** The stored offsets still point at the anchor text. */
   | 'offset'
+  /** The chunk is verified, but its text repeats inside it: go to the chunk start. */
+  | 'chunk'
   /** The offsets were stale or missing; a unique match was found by context. */
   | 'context'
   /** Only the anchor's section heading could be verified. */
@@ -31,8 +40,10 @@ export interface AnchorTarget {
   start: number;
   /** End of the matched line (the passage scrolled into view), never the whole chunk. */
   end: number;
-  /** An exact literal match worth highlighting (full-text only). */
+  /** A verified exact literal match worth highlighting (never in semantic mode). */
   highlight?: { start: number; end: number };
+  /** The verified passage, for a subtle block marker when nothing literal matched. */
+  passage?: { start: number; end: number };
   /** Text to look for in rendered (Reading view) blocks. Empty for heading targets. */
   matchText: string;
   confidence: AnchorConfidence;
@@ -69,14 +80,131 @@ export function resolveAnchorTarget(
   options: ResolveOptions = {},
 ): AnchorTarget | null {
   const bases = bodyStartCandidates(content);
+  // The exact hit is used (as target and highlight) only where literal matches count;
+  // semantic mode goes to the passage start.
+  const passage = resolveByPassage(
+    content,
+    anchor,
+    bases,
+    options.queryWords ?? [],
+    options.highlightExact ?? false,
+  );
+  if (passage) return passage;
+  const exact = resolveExactHit(content, anchor, bases, options.queryWords ?? []);
   const target =
-    resolveByOffsets(content, anchor, bases) ?? resolveByContext(content, anchor, bases[0]!);
+    exact?.target ??
+    resolveByOffsets(content, anchor, bases) ??
+    resolveByContext(content, anchor, bases[0]!);
   if (!target) return null;
-  if (options.highlightExact && anchor.kind === 'bm25' && target.confidence !== 'heading') {
-    const highlight = findQueryWord(content, target.start, target.end, options.queryWords ?? []);
-    if (highlight) target.highlight = highlight;
+  // Only verified literal evidence is highlighted: the engine's exact hit, or a query
+  // word found in the verified matched line. Chunk and heading fallbacks never are.
+  if (options.highlightExact && anchor.kind === 'bm25') {
+    if (exact) {
+      target.highlight = exact.hit;
+    } else if (target.confidence === 'offset' || target.confidence === 'context') {
+      const highlight = findQueryWord(content, target.start, target.end, options.queryWords ?? []);
+      if (highlight) target.highlight = highlight;
+    }
   }
   return target;
+}
+
+/**
+ * The engine's selected passage, verified: it must still start at a line start, fit
+ * in the text, and hold the anchor's `matchText` (on its first line for semantic
+ * anchors, whose `matchText` is that line). The target is the exact hit when `useHit`
+ * and the hit is verified too (inside the passage, one line, whole token), else the
+ * passage start.
+ * A note edited above the passage shifts it off its text and the older checks run.
+ */
+function resolveByPassage(
+  content: string,
+  anchor: MatchAnchor,
+  bases: number[],
+  queryWords: readonly string[],
+  useHit: boolean,
+): AnchorTarget | null {
+  const { passageStart, passageEnd } = anchor;
+  if (typeof passageStart !== 'number' || typeof passageEnd !== 'number') return null;
+  if (passageStart < 0 || passageEnd <= passageStart) return null;
+  for (const base of bases) {
+    const start = base + passageStart;
+    const end = base + passageEnd;
+    if (end > content.length || (start > 0 && content[start - 1] !== '\n')) continue;
+    if (anchor.matchText) {
+      const matches = findAllInRange(content, start, end, anchor.matchText);
+      if (matches.length === 0) continue;
+      if (anchor.kind === 'semantic' && matches[0]!.start > lineEnd(content, start)) continue;
+    }
+    const hit = useHit ? verifiedHit(content, anchor, base, start, end, queryWords) : undefined;
+    const focus = hit?.start ?? start;
+    return {
+      start: focus,
+      end: lineEnd(content, focus),
+      matchText: anchor.matchText,
+      confidence: 'passage',
+      passage: { start, end },
+      ...(hit && { highlight: hit }),
+    };
+  }
+  return null;
+}
+
+function verifiedHit(
+  content: string,
+  anchor: MatchAnchor,
+  base: number,
+  passageStart: number,
+  passageEnd: number,
+  queryWords: readonly string[],
+): { start: number; end: number } | undefined {
+  const { matchStart, matchEnd } = anchor;
+  if (typeof matchStart !== 'number' || typeof matchEnd !== 'number') return undefined;
+  const start = base + matchStart;
+  const end = base + matchEnd;
+  if (start < passageStart || end > passageEnd || end <= start) return undefined;
+  if (content.slice(start, end).includes('\n')) return undefined;
+  return isWholeTokenHit(content, start, end, queryWords) ? { start, end } : undefined;
+}
+
+/**
+ * BM25 anchors from newer engines carry the exact hit (`matchStart`/`matchEnd`, body
+ * relative). It is trusted only when it still lies inside the anchor's chunk, stays on
+ * one line, sits on word boundaries, agrees with a query word (when known), and its
+ * line still contains the anchor's `matchText`. A note edited above the hit shifts it
+ * off the word, so the check fails and the slower fallbacks run instead.
+ */
+function resolveExactHit(
+  content: string,
+  anchor: MatchAnchor,
+  bases: number[],
+  queryWords: readonly string[],
+): { target: AnchorTarget; hit: { start: number; end: number } } | null {
+  const { matchStart, matchEnd } = anchor;
+  if (typeof matchStart !== 'number' || typeof matchEnd !== 'number') return null;
+  if (matchStart < 0 || matchEnd <= matchStart) return null;
+  for (const base of bases) {
+    const start = base + matchStart;
+    const end = base + matchEnd;
+    if (end > content.length || content.slice(start, end).includes('\n')) continue;
+    if (typeof anchor.charStart === 'number' && typeof anchor.charEnd === 'number') {
+      if (start < base + anchor.charStart || end > base + anchor.charEnd) continue;
+    }
+    if (!isWholeTokenHit(content, start, end, queryWords)) continue;
+    const lineStart = content.lastIndexOf('\n', start - 1) + 1;
+    const stop = lineEnd(content, start);
+    if (
+      anchor.matchText &&
+      findAllInRange(content, lineStart, stop, anchor.matchText).length === 0
+    ) {
+      continue;
+    }
+    return {
+      target: { start, end: stop, matchText: anchor.matchText, confidence: 'exact' },
+      hit: { start, end },
+    };
+  }
+  return null;
 }
 
 /**
@@ -117,10 +245,19 @@ function resolveByOffsets(
     const end = base + anchor.charEnd;
     if (end > content.length) continue;
     if (anchor.matchText) {
-      const match = findFirstInRange(content, start, end, anchor.matchText);
-      if (match)
-        return { ...lineSpan(content, match), matchText: anchor.matchText, confidence: 'offset' };
-      continue;
+      const matches = findAllInRange(content, start, end, anchor.matchText);
+      if (matches.length === 0) continue;
+      const first = matches[0]!;
+      // One occurrence is proof. With repeats, a semantic anchor's text is the chunk's
+      // opening line, so its first occurrence counts only when nothing but headings or
+      // blank lines precede it; otherwise only the chunk itself is verified.
+      if (
+        matches.length === 1 ||
+        (anchor.kind === 'semantic' && opensChunk(content, start, first.start))
+      ) {
+        return { ...lineSpan(content, first), matchText: anchor.matchText, confidence: 'offset' };
+      }
+      return { start, end: lineEnd(content, start), matchText: '', confidence: 'chunk' };
     }
     // No text to compare (e.g. a chunk made only of a heading): the chunk must still
     // begin with the anchor's own heading line.
@@ -245,8 +382,34 @@ function findAllInRange(content: string, from: number, to: number, needle: strin
   return findAll(content, from, to, prefix);
 }
 
-function findFirstInRange(content: string, from: number, to: number, needle: string): Match | null {
-  return findAllInRange(content, from, to, needle)[0] ?? null;
+const WORD_CHAR = /[\p{L}\p{N}_]/u;
+
+function isWholeTokenHit(
+  content: string,
+  start: number,
+  end: number,
+  queryWords: readonly string[],
+): boolean {
+  const before = content[start - 1];
+  const after = content[end];
+  if (!WORD_CHAR.test(content[start] ?? '') || !WORD_CHAR.test(content[end - 1] ?? '')) {
+    return false;
+  }
+  if ((before && WORD_CHAR.test(before)) || (after && WORD_CHAR.test(after))) return false;
+  const hit = normalize(content, start, end).text;
+  if (!hit) return false;
+  const words = queryWords.map((w) => normalize(w).text).filter(Boolean);
+  // FTS matches query words as prefixes, and splits snake_case into separate hits.
+  return words.length === 0 || words.some((w) => hit.startsWith(w) || w.startsWith(hit));
+}
+
+/** True when only heading lines, blank lines or fence markers come before `offset`. */
+function opensChunk(content: string, chunkStart: number, offset: number): boolean {
+  return content
+    .slice(chunkStart, offset)
+    .split('\n')
+    .slice(0, -1)
+    .every((line) => line.trim() === '' || /^\s*#{1,6}\s/.test(line));
 }
 
 function findAll(content: string, from: number, to: number, needle: string): Match[] {

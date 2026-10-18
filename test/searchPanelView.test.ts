@@ -95,7 +95,7 @@ describe('SearchPanelView', () => {
     const plugin = {
       manifest: { id: 'hybrid-search' },
       app,
-      settings: { ...DEFAULT_SETTINGS },
+      settings: { ...DEFAULT_SETTINGS, showSearchDiagnostics: true },
       client: { search: vi.fn().mockResolvedValue([result]) },
     };
     const view = new SearchPanelView(leaf, plugin as never);
@@ -432,8 +432,15 @@ describe('SearchPanelView', () => {
   });
 
   it('expands individual results and all result snippets', async () => {
+    const anchored = (r: SearchResult): SearchResult => ({
+      ...r,
+      previewAnchors: [
+        { kind: 'bm25', headingPath: null, matchText: r.snippet!, charStart: null, charEnd: null },
+      ],
+      primaryAnchorIndex: 0,
+    });
     const secondResult: SearchResult = {
-      ...result,
+      ...anchored(result),
       path: 'second.md',
       title: 'Second',
       score: 0.8,
@@ -453,7 +460,7 @@ describe('SearchPanelView', () => {
       manifest: { id: 'hybrid-search' },
       app,
       settings: { ...DEFAULT_SETTINGS },
-      client: { search: vi.fn().mockResolvedValue([result, secondResult]) },
+      client: { search: vi.fn().mockResolvedValue([anchored(result), secondResult]) },
     };
     const view = new SearchPanelView(leaf, plugin as never);
     await view.onOpen();
@@ -569,7 +576,15 @@ describe('SearchPanelView', () => {
     await new Promise((resolve) => window.setTimeout(resolve, 0));
 
     // The chunk is not selected; the leaf gets a line hint for the verified passage.
-    expect(openFile).toHaveBeenCalledWith(file, { active: true, eState: { line: 1 } });
+    expect(openFile).toHaveBeenCalledWith(file, {
+      active: true,
+      eState: {
+        cursor: {
+          from: expect.objectContaining({ line: 1 }),
+          to: expect.objectContaining({ line: 1 }),
+        },
+      },
+    });
   });
 
   it('falls back to match text when a snippet anchor offset is stale', async () => {
@@ -618,7 +633,15 @@ describe('SearchPanelView', () => {
     await new Promise((resolve) => window.setTimeout(resolve, 0));
 
     // The offset is stale, but the anchor text is unique in the note.
-    expect(openFile).toHaveBeenCalledWith(file, { active: true, eState: { line: 1 } });
+    expect(openFile).toHaveBeenCalledWith(file, {
+      active: true,
+      eState: {
+        cursor: {
+          from: expect.objectContaining({ line: 1 }),
+          to: expect.objectContaining({ line: 1 }),
+        },
+      },
+    });
   });
 
   it('keeps snippet anchors for modifier-clicks and keyboard activation', async () => {
@@ -669,7 +692,7 @@ describe('SearchPanelView', () => {
     expect(tabOpenFile).toHaveBeenCalledWith(
       file,
       expect.objectContaining({
-        eState: expect.objectContaining({ line: 1 }),
+        eState: { cursor: { from: { line: 1, ch: 0 }, to: { line: 1, ch: 0 } } },
       }),
     );
 
@@ -679,7 +702,7 @@ describe('SearchPanelView', () => {
     expect(markdownOpenFile).toHaveBeenCalledWith(
       file,
       expect.objectContaining({
-        eState: expect.objectContaining({ line: 1 }),
+        eState: { cursor: { from: { line: 1, ch: 0 }, to: { line: 1, ch: 0 } } },
       }),
     );
   });
@@ -725,19 +748,36 @@ describe('SearchPanelView', () => {
     const view = new SearchPanelView(leaf, plugin as never);
     await view.onOpen();
     await (view as unknown as { search: (query: string) => Promise<void> }).search('target');
-    expect(view.containerEl.querySelector('.hybrid-search-panel-heading')?.textContent).toBe(
-      'Part',
-    );
+    expect(
+      view.containerEl.querySelector('.hybrid-search-panel-context .search-plus-result-heading')
+        ?.textContent,
+    ).toBe('Part');
 
     const input = view.containerEl.querySelector<HTMLInputElement>('.hybrid-search-panel-input')!;
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
     await vi.waitFor(() =>
-      expect(markdownOpenFile).toHaveBeenCalledWith(file, { active: true, eState: { line: 5 } }),
+      expect(markdownOpenFile).toHaveBeenCalledWith(file, {
+        active: true,
+        eState: {
+          cursor: {
+            from: expect.objectContaining({ line: 5 }),
+            to: expect.objectContaining({ line: 5 }),
+          },
+        },
+      }),
     );
 
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'o', ctrlKey: true, bubbles: true }));
     await vi.waitFor(() =>
-      expect(tabOpenFile).toHaveBeenCalledWith(file, { active: true, eState: { line: 5 } }),
+      expect(tabOpenFile).toHaveBeenCalledWith(file, {
+        active: true,
+        eState: {
+          cursor: {
+            from: expect.objectContaining({ line: 5 }),
+            to: expect.objectContaining({ line: 5 }),
+          },
+        },
+      }),
     );
     expect(app.workspace.getLeaf).toHaveBeenCalledWith('tab');
   });

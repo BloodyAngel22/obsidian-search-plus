@@ -296,3 +296,182 @@ describe('getPrimaryAnchor', () => {
     expect(getPrimaryAnchor({})).toBeUndefined();
   });
 });
+
+describe('exact hits and repeats inside a chunk', () => {
+  const fm = '---\ntype: learn\n---\n';
+  const body = [
+    '## Notes',
+    '',
+    'Retry the job later.',
+    'Some filler words in between.',
+    'Retry the job later with ReplacingMergeTree dedup.',
+  ].join('\n');
+  const content = fm + body;
+  const hitStart = body.indexOf('ReplacingMergeTree');
+  const bm25: MatchAnchor = {
+    kind: 'bm25',
+    headingPath: '## Notes',
+    matchText: 'Retry the job later with ReplacingMergeTree dedup.',
+    charStart: 0,
+    charEnd: body.length,
+    matchStart: hitStart,
+    matchEnd: hitStart + 'ReplacingMergeTree'.length,
+  };
+
+  it('uses the engine exact hit (body offsets + frontmatter) and highlights it', () => {
+    const target = resolveAnchorTarget(content, bm25, { highlightExact: true })!;
+    expect(target.confidence).toBe('exact');
+    expect(content.slice(target.start)).toMatch(/^ReplacingMergeTree/);
+    expect(content.slice(target.highlight!.start, target.highlight!.end)).toBe(
+      'ReplacingMergeTree',
+    );
+  });
+
+  it('does not highlight the exact hit for semantic searches', () => {
+    expect(
+      resolveAnchorTarget(content, bm25, { highlightExact: false })!.highlight,
+    ).toBeUndefined();
+  });
+
+  it('rejects a stale exact hit whose line changed, then falls back safely', () => {
+    const edited = content.replace(
+      'Some filler words in between.',
+      'Added a much longer line here.',
+    );
+    const target = resolveAnchorTarget(edited, bm25, { highlightExact: true });
+    expect(target?.confidence).not.toBe('exact');
+    // The matched line is unique in the chunk, so the line itself is still found.
+    expect(edited.slice(target!.start)).toMatch(/^Retry the job later with/);
+  });
+
+  it('does not take the first repeat of a BM25 line inside a chunk as the hit', () => {
+    const repeated = 'Shared line.\nOther text.\nShared line.\n';
+    const a: MatchAnchor = {
+      kind: 'bm25',
+      headingPath: null,
+      matchText: 'Shared line.',
+      charStart: 0,
+      charEnd: repeated.length,
+    };
+    const target = resolveAnchorTarget(repeated, a, {
+      highlightExact: true,
+      queryWords: ['shared'],
+    })!;
+    expect(target.confidence).toBe('chunk');
+    expect(target.start).toBe(0);
+    expect(target.highlight).toBeUndefined();
+  });
+
+  it('accepts a repeated semantic opening line at the start of its chunk', () => {
+    const text = '## Topic\n\nShared line.\nOther text.\nShared line.\n';
+    const a: MatchAnchor = {
+      kind: 'semantic',
+      headingPath: '## Topic',
+      matchText: 'Shared line.',
+      charStart: 0,
+      charEnd: text.length,
+    };
+    const target = resolveAnchorTarget(text, a)!;
+    expect(target.confidence).toBe('offset');
+    expect(target.start).toBe(text.indexOf('Shared line.'));
+  });
+});
+
+describe('selected passage (newer engines)', () => {
+  const fm = '---\ntags: [db]\n---\n';
+  const passageBody = [
+    '### Что я узнал нового для себя',
+    '',
+    'Clickhouse хранит данные не в одной непрерывной таблице, а в отдельных частях.',
+    '',
+    'Когда в clickhouse поступают новые записи, clickhouse создает части. Позже части объединяются (merge).',
+    '',
+    '`ReplacingMergeTree` - схлопывает дубликаты. MergeTree хранит части.',
+    '',
+    '## Повтор',
+    '',
+    'Clickhouse хранит данные не в одной непрерывной таблице, а в отдельных частях.',
+  ].join('\n');
+  const text = fm + passageBody;
+  const answer =
+    'Когда в clickhouse поступают новые записи, clickhouse создает части. Позже части объединяются (merge).';
+  const chunkStart = 0;
+
+  function passageAnchor(passage: string, extra: Partial<MatchAnchor> = {}): MatchAnchor {
+    const passageStart = passageBody.indexOf(passage);
+    return {
+      kind: 'semantic',
+      headingPath: '### Что я узнал нового для себя',
+      matchText: passage.slice(0, 80),
+      charStart: chunkStart,
+      charEnd: passageBody.indexOf('## Повтор'),
+      passageStart,
+      passageEnd: passageStart + passage.length,
+      ...extra,
+    };
+  }
+
+  it('goes to the selected paragraph, not the chunk start (ClickHouse)', () => {
+    const target = resolveAnchorTarget(text, passageAnchor(answer));
+    expect(target?.confidence).toBe('passage');
+    expect(target?.start).toBe(text.indexOf('Когда в clickhouse'));
+    expect(target?.passage).toEqual({
+      start: text.indexOf(answer),
+      end: text.indexOf(answer) + answer.length,
+    });
+    expect(target?.highlight).toBeUndefined();
+  });
+
+  it('uses offsets, so text repeated in another section is never the target', () => {
+    const first = 'Clickhouse хранит данные не в одной непрерывной таблице, а в отдельных частях.';
+    const target = resolveAnchorTarget(text, passageAnchor(first));
+    expect(target?.start).toBe(text.indexOf(first));
+    expect(target?.start).toBeLessThan(text.indexOf('## Повтор'));
+  });
+
+  it('targets and highlights a verified exact identifier, never one inside a longer one', () => {
+    const passage = '`ReplacingMergeTree` - схлопывает дубликаты. MergeTree хранит части.';
+    const exact = passageBody.indexOf(' MergeTree') + 1;
+    const good = passageAnchor(passage, { matchStart: exact, matchEnd: exact + 9 });
+    const target = resolveAnchorTarget(text, good, {
+      highlightExact: true,
+      queryWords: ['mergetree'],
+    });
+    expect(text.slice(target!.highlight!.start, target!.highlight!.end)).toBe('MergeTree');
+    expect(target?.start).toBe(target!.highlight!.start);
+    // Offsets pointing into "ReplacingMergeTree": not a whole token, so no highlight.
+    const inside = passageBody.indexOf('MergeTree`');
+    const bad = passageAnchor(passage, { matchStart: inside, matchEnd: inside + 9 });
+    const fallback = resolveAnchorTarget(text, bad, {
+      highlightExact: true,
+      queryWords: ['mergetree'],
+    });
+    expect(fallback?.highlight).toBeUndefined();
+    expect(fallback?.start).toBe(text.indexOf(passage));
+  });
+
+  it('does not highlight when exact highlighting is off (semantic mode)', () => {
+    const passage = '`ReplacingMergeTree` - схлопывает дубликаты. MergeTree хранит части.';
+    const exact = passageBody.indexOf(' MergeTree') + 1;
+    const target = resolveAnchorTarget(
+      text,
+      passageAnchor(passage, { matchStart: exact, matchEnd: exact + 9 }),
+      { highlightExact: false },
+    );
+    expect(target?.highlight).toBeUndefined();
+    expect(target?.start).toBe(text.indexOf(passage));
+  });
+
+  it('falls back to the older checks when the note was edited above the passage', () => {
+    const edited = fm + 'A new first line.\n\n' + passageBody;
+    const target = resolveAnchorTarget(edited, passageAnchor(answer));
+    expect(target?.confidence).not.toBe('passage');
+    expect(target?.start).toBe(edited.indexOf(answer));
+  });
+
+  it('rejects a semantic passage whose first line no longer holds its text', () => {
+    const anchor = passageAnchor(answer, { matchText: 'совсем другой текст которого нет' });
+    const target = resolveAnchorTarget(text, anchor);
+    expect(target?.confidence).not.toBe('passage');
+  });
+});

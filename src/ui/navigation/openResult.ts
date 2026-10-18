@@ -14,6 +14,7 @@ import {
   type AnchorTarget,
   type ResolveOptions,
 } from './anchorResolver';
+import { flashEditorRange } from './editorHighlight';
 
 type SearchMode = 'hybrid' | 'semantic' | 'fulltext' | 'title';
 
@@ -66,9 +67,12 @@ export async function openResultAtAnchor(
 
   const openState: OpenViewState = {};
   if (options.active !== undefined) openState.active = options.active;
-  // A line hint lets Obsidian start at the passage instead of flashing the top first.
+  // A collapsed cursor lets Obsidian start at the passage instead of flashing the top
+  // first. Not `line`: Obsidian SELECTS the whole line for that state, and may apply it
+  // after our own cursor, leaving a selection that the next keystroke would replace.
   if (target && content !== undefined) {
-    openState.eState = { line: offsetToEditorPosition(content, target.start).line };
+    const at = offsetToEditorPosition(content, target.start);
+    openState.eState = { cursor: { from: at, to: at } };
   }
   if (Object.keys(openState).length > 0) await leaf.openFile(file, openState);
   else await leaf.openFile(file);
@@ -120,20 +124,26 @@ function readViewData(view: MarkdownView): string | undefined {
   }
 }
 
-/** Source mode and Live Preview: cursor at the passage, scrolled to the middle. */
+/**
+ * Source mode and Live Preview: cursor at the target (the exact hit, or the passage
+ * start), scrolled to the middle, and a short-lived marker instead of a selection: the
+ * exact hit inline, else the verified passage's lines. Nothing is selected, so typing
+ * right away never replaces text.
+ */
 function revealInEditor(view: MarkdownView, content: string, target: AnchorTarget): void {
   const editor = view.editor;
   const from = offsetToEditorPosition(content, target.start);
   const to = offsetToEditorPosition(content, target.end);
-  if (target.highlight) {
-    editor.setSelection(
-      offsetToEditorPosition(content, target.highlight.start),
-      offsetToEditorPosition(content, target.highlight.end),
-    );
-  } else {
-    editor.setCursor(from);
-  }
+  editor.setCursor(from);
   editor.scrollIntoView({ from, to }, true);
+  if (target.highlight) {
+    flashEditorRange(view, target.highlight.start, target.highlight.end, 'hit', FLASH_MS);
+  } else if (target.passage) {
+    flashEditorRange(view, target.passage.start, target.passage.end, 'passage', FLASH_MS);
+  } else if (target.confidence !== 'chunk' && target.confidence !== 'heading') {
+    // An older engine's verified line: mark that line only.
+    flashEditorRange(view, target.start, target.end, 'passage', FLASH_MS);
+  }
 }
 
 /**
@@ -164,11 +174,19 @@ async function revealInReadingView(
 const BLOCK_SELECTOR =
   'p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th, pre, .callout-title-inner';
 
-/** The rendered block for a target, or undefined when no block matches clearly. */
+/**
+ * The rendered block for a target, or undefined when no block matches clearly.
+ *
+ * When several blocks repeat the text, `tieBreak` decides: `viewport` (Reading view,
+ * already scrolled to the target line) takes the block nearest the top of the
+ * viewport; `position` (an unscrolled preview) takes the block whose position in the
+ * rendered text best matches the target's position in the source.
+ */
 export function findRenderedBlock(
   container: HTMLElement,
   content: string,
   target: AnchorTarget,
+  tieBreak: 'viewport' | 'position' = 'viewport',
 ): HTMLElement | undefined {
   const needle = normalize(target.matchText || headingText(content, target.start)).text;
   if (!needle) return undefined;
@@ -182,8 +200,12 @@ export function findRenderedBlock(
   // Prefer the innermost block (a <li> rather than its parent list item's <ul> text).
   matches = matches.filter((el) => !matches.some((other) => other !== el && el.contains(other)));
   if (matches.length <= 1) return matches[0];
-  // Several blocks repeat the text: the view was just scrolled to the target line, so the
-  // one nearest the top of the viewport is the intended one.
+  return tieBreak === 'position'
+    ? closestByPosition(container, blocks, matches, target.start / Math.max(1, content.length))
+    : closestToViewportTop(container, matches);
+}
+
+function closestToViewportTop(container: HTMLElement, matches: HTMLElement[]): HTMLElement {
   const top = container.getBoundingClientRect().top;
   let best = matches[0]!;
   let bestDistance = Infinity;
@@ -193,6 +215,29 @@ export function findRenderedBlock(
       bestDistance = distance;
       best = el;
     }
+  }
+  return best;
+}
+
+function closestByPosition(
+  container: HTMLElement,
+  blocks: HTMLElement[],
+  matches: HTMLElement[],
+  targetFraction: number,
+): HTMLElement {
+  const total = Math.max(1, (container.textContent ?? '').length);
+  let best = matches[0]!;
+  let bestDiff = Infinity;
+  let consumed = 0;
+  for (const block of blocks) {
+    if (matches.includes(block)) {
+      const diff = Math.abs(consumed / total - targetFraction);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        best = block;
+      }
+    }
+    consumed += (block.textContent ?? '').length;
   }
   return best;
 }

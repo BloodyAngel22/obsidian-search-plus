@@ -292,10 +292,48 @@ describe('SearchModal', () => {
     expect(link?.getAttribute('data-link-status')).toBe('active');
   });
 
-  it('renderSuggestion shows score', () => {
+  it('renderSuggestion hides the score by default (it is a ranking signal, not confidence)', () => {
     const el = activeDocument.createDiv();
     modal.renderSuggestion(sampleResult, el);
+    expect(el.querySelector('.hybrid-search-score')).toBeNull();
+    expect(el.querySelector('.search-plus-result-diagnostics')).toBeNull();
+  });
+
+  it('renderSuggestion shows score and passage details in the diagnostics view', () => {
+    const diag = new SearchModal(
+      mockApp as never,
+      mockClient,
+      { ...DEFAULT_SETTINGS, showSearchDiagnostics: true },
+      vi.fn(),
+    );
+    const el = activeDocument.createDiv();
+    diag.renderSuggestion(
+      {
+        ...sampleResult,
+        scores: { hybrid: 0.5, bm25: 0.4, semantic: null, fuzzy_title: null },
+        snippetSource: 'bm25',
+        previewAnchors: [
+          {
+            kind: 'bm25',
+            headingPath: null,
+            matchText: 'x',
+            charStart: 10,
+            charEnd: 90,
+            matchStart: 20,
+            matchEnd: 29,
+          },
+        ],
+        primaryAnchorIndex: 0,
+      },
+      el,
+    );
     expect(el.querySelector('.hybrid-search-score')?.textContent).toBe('0.87');
+    const line = el.querySelector('.search-plus-result-diagnostics')!.textContent!;
+    expect(line).toContain('rrf 0.500');
+    expect(line).toContain('passage bm25');
+    expect(line).toContain('chunk 10–90');
+    expect(line).toContain('hit 20–29');
+    expect(line).toContain('snippet bm25');
   });
 
   it('renderSuggestion does not show tags when showMeta is false', () => {
@@ -404,7 +442,14 @@ describe('SearchModal', () => {
     await vi.waitFor(() =>
       expect(mockOpenFile).toHaveBeenCalledWith(
         expect.objectContaining({ path: sampleResult.path }),
-        { eState: { line: 7 } },
+        {
+          eState: {
+            cursor: {
+              from: expect.objectContaining({ line: 7 }),
+              to: expect.objectContaining({ line: 7 }),
+            },
+          },
+        },
       ),
     );
   });
@@ -762,6 +807,7 @@ describe('SearchModal — default behavior (S-102)', () => {
     expect(mockSearch).toHaveBeenCalledWith('', {
       limit: DEFAULT_SETTINGS.similarNotesBottomLimit + 1,
       notePath: activeFilePath,
+      anchors: true,
     });
     vi.useRealTimers();
   });
@@ -845,9 +891,14 @@ describe('SearchModal — default behavior (S-102)', () => {
     expect(el.querySelector('.hybrid-search-score')).toBeNull();
   });
 
-  it('renderSuggestion shows score after a real search query', async () => {
+  it('renderSuggestion shows score after a real search query (diagnostics on)', async () => {
     vi.useFakeTimers();
-    const modal = new SearchModal(mockApp as never, mockClient, DEFAULT_SETTINGS, vi.fn());
+    const modal = new SearchModal(
+      mockApp as never,
+      mockClient,
+      { ...DEFAULT_SETTINGS, showSearchDiagnostics: true },
+      vi.fn(),
+    );
     const promise = modal.getSuggestions('zettel');
     vi.runAllTimers();
     await promise;
@@ -855,114 +906,6 @@ describe('SearchModal — default behavior (S-102)', () => {
     modal.renderSuggestion(sampleResult, el);
     expect(el.querySelector('.hybrid-search-score')).not.toBeNull();
     vi.useRealTimers();
-  });
-});
-
-describe('getHeadingSiblings', () => {
-  let modal: SearchModal;
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mockSearch.mockResolvedValue([sampleResult]);
-    mockCachedRead.mockResolvedValue('# Note Content\n\nSome body text.');
-    mockGetAbstractFileByPath.mockReturnValue(
-      Object.assign(new TFile(), { path: sampleResult.path }),
-    );
-    modal = new SearchModal(mockApp as never, mockClient, DEFAULT_SETTINGS, vi.fn());
-  });
-
-  it('returns siblings until next same-level heading', () => {
-    const container = activeDocument.createDiv();
-    const makeEl = (tag: keyof HTMLElementTagNameMap, text?: string) => {
-      const el = activeDocument.createEl(tag);
-      if (text) el.textContent = text;
-      return el;
-    };
-    container.append(
-      makeEl('h2', 'Section A'),
-      makeEl('p', 'Para 1'),
-      makeEl('p', 'Para 2'),
-      makeEl('h3', 'Subsection'),
-      makeEl('p', 'Sub para'),
-      makeEl('h2', 'Section B'),
-      makeEl('p', 'B para'),
-    );
-    const h2a = container.querySelector('h2') as HTMLElement;
-    const siblings = (
-      modal as unknown as {
-        getHeadingSiblings(h: HTMLElement): Element[];
-      }
-    ).getHeadingSiblings(h2a);
-    // Should include p, p, h3, p — stop at second h2
-    expect(siblings.length).toBe(4);
-    expect(siblings[0]!.tagName).toBe('P');
-    expect(siblings[2]!.tagName).toBe('H3');
-    // Should NOT include "B para"
-    expect(siblings.some((el) => el.textContent?.includes('B para'))).toBe(false);
-  });
-
-  it('returns all remaining siblings when no closing heading', () => {
-    const container = activeDocument.createDiv();
-    const h2El = activeDocument.createEl('h2');
-    h2El.textContent = 'Heading';
-    const p1 = activeDocument.createEl('p');
-    p1.textContent = 'First paragraph';
-    const p2 = activeDocument.createEl('p');
-    p2.textContent = 'Second paragraph';
-    container.append(h2El, p1, p2);
-    const h2 = container.querySelector('h2') as HTMLElement;
-    const siblings = (
-      modal as unknown as {
-        getHeadingSiblings(h: HTMLElement): Element[];
-      }
-    ).getHeadingSiblings(h2);
-    expect(siblings.length).toBe(2);
-  });
-});
-
-describe('findHeadingElement', () => {
-  let modal: SearchModal;
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mockSearch.mockResolvedValue([sampleResult]);
-    mockCachedRead.mockResolvedValue('# Note Content\n\nSome body text.');
-    mockGetAbstractFileByPath.mockReturnValue(
-      Object.assign(new TFile(), { path: sampleResult.path }),
-    );
-    modal = new SearchModal(mockApp as never, mockClient, DEFAULT_SETTINGS, vi.fn());
-  });
-
-  it('finds leaf heading by headingPath', () => {
-    const preview = activeDocument.createDiv();
-    const h2 = activeDocument.createEl('h2');
-    h2.textContent = 'Parent';
-    const h3 = activeDocument.createEl('h3');
-    h3.textContent = 'Child section';
-    const p = activeDocument.createEl('p');
-    p.textContent = 'Content';
-    preview.append(h2, h3, p);
-    (modal as unknown as { previewEl: HTMLElement }).previewEl = preview;
-
-    const result = (
-      modal as unknown as {
-        findHeadingElement(hp: string | null): HTMLElement | undefined;
-      }
-    ).findHeadingElement('Parent > Child section');
-
-    expect(result).toBeDefined();
-    expect(result!.tagName).toBe('H3');
-    expect(result!.textContent?.trim()).toBe('Child section');
-  });
-
-  it('returns undefined for null headingPath', () => {
-    (modal as unknown as { previewEl: HTMLElement }).previewEl = activeDocument.createDiv();
-    const result = (
-      modal as unknown as {
-        findHeadingElement(hp: string | null): HTMLElement | undefined;
-      }
-    ).findHeadingElement(null);
-    expect(result).toBeUndefined();
   });
 });
 
@@ -1051,5 +994,115 @@ describe('anchor-based highlight', () => {
 
     // Still same number of renders (no re-render for same path)
     expect(mockRender.mock.calls.length).toBe(renderCount1);
+  });
+});
+
+describe('preview and navigation use the same passage', () => {
+  const content = [
+    '---',
+    'a: 1',
+    '---',
+    '## Alpha',
+    'Shared sentence here.',
+    '## Beta',
+    'Shared sentence here.',
+  ].join('\n');
+  const anchor: MatchAnchor = {
+    kind: 'semantic',
+    headingPath: '## Beta',
+    matchText: 'Shared sentence here.',
+    charStart: null,
+    charEnd: null,
+  };
+  const result: SearchResult = {
+    ...sampleResult,
+    previewAnchors: [anchor],
+    primaryAnchorIndex: 0,
+  };
+
+  /** Render each line as a block, like Obsidian's renderer would. */
+  function renderBlocks(): void {
+    mockRender.mockImplementationOnce((_app, source: string, el: HTMLElement) => {
+      for (const line of source.split('\n')) {
+        if (line === '---' || line.startsWith('a:')) continue;
+        if (line.startsWith('## ')) el.createEl('h2', { text: line.slice(3) });
+        else el.createEl('p', { text: line });
+      }
+      return Promise.resolve();
+    });
+  }
+
+  afterEach(() => {
+    activeDocument
+      .querySelectorAll(BODY_PANEL_CLASSES.map((cls) => `.${cls}`).join(', '))
+      .forEach((el) => el.remove());
+  });
+
+  it('marks the repeated sentence in the anchor section, where Enter navigates', async () => {
+    vi.clearAllMocks();
+    mockCachedRead.mockResolvedValue(content);
+    mockGetAbstractFileByPath.mockReturnValue(
+      Object.assign(new TFile(), { path: sampleResult.path }),
+    );
+    const modal = new SearchModal(
+      mockApp as never,
+      mockClient,
+      { ...DEFAULT_SETTINGS, showPreview: true, scrollToSnippet: true },
+      vi.fn(),
+    );
+    renderBlocks();
+    await (modal as unknown as ModalInternals).updatePreview(
+      sampleResult.path,
+      'snippet',
+      [anchor],
+      0,
+    );
+    const previewEl = (modal as unknown as ModalInternals).previewEl!;
+    const marked = previewEl.querySelectorAll('.hybrid-search-semantic-match');
+    expect(marked).toHaveLength(1);
+    expect(marked[0]).toBe(previewEl.querySelectorAll('p')[1]);
+    // Previewing opened nothing.
+    expect(mockOpenFile).not.toHaveBeenCalled();
+
+    modal.onChooseSuggestion(result, new MouseEvent('click'));
+    await vi.waitFor(() =>
+      expect(mockOpenFile).toHaveBeenCalledWith(expect.anything(), {
+        eState: {
+          cursor: {
+            from: expect.objectContaining({ line: 6 }),
+            to: expect.objectContaining({ line: 6 }),
+          },
+        },
+      }),
+    );
+  });
+
+  it('marks nothing for a stale anchor, and opening falls back to the note top', async () => {
+    vi.clearAllMocks();
+    const stale = content
+      .replace(/Shared sentence here\./g, 'Rewritten.')
+      .replace('## Beta', '## Gamma');
+    mockCachedRead.mockResolvedValue(stale);
+    mockGetAbstractFileByPath.mockReturnValue(
+      Object.assign(new TFile(), { path: sampleResult.path }),
+    );
+    const modal = new SearchModal(
+      mockApp as never,
+      mockClient,
+      { ...DEFAULT_SETTINGS, showPreview: true, scrollToSnippet: true },
+      vi.fn(),
+    );
+    renderBlocks();
+    await (modal as unknown as ModalInternals).updatePreview(
+      sampleResult.path,
+      'snippet',
+      [anchor],
+      0,
+    );
+    const previewEl = (modal as unknown as ModalInternals).previewEl!;
+    expect(previewEl.querySelector('.hybrid-search-semantic-match')).toBeNull();
+    modal.onChooseSuggestion(result, new MouseEvent('click'));
+    await vi.waitFor(() => expect(mockOpenFile).toHaveBeenCalled());
+    expect(mockOpenFile.mock.calls[0]).toHaveLength(1);
   });
 });

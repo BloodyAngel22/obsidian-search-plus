@@ -1,7 +1,13 @@
 import { MarkdownView, TFile, WorkspaceLeaf } from 'obsidian';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SearchResult } from '../../src/ipc';
+import { flashEditorRange } from '../../src/ui/navigation/editorHighlight';
 import { findRenderedBlock, openResultAtAnchor } from '../../src/ui/navigation/openResult';
+
+vi.mock('../../src/ui/navigation/editorHighlight', () => ({
+  flashEditorRange: vi.fn(() => true),
+}));
+const flash = vi.mocked(flashEditorRange);
 
 const frontmatter = '---\ntype: learn\n---\n';
 const body = [
@@ -87,7 +93,14 @@ describe('openResultAtAnchor', () => {
       queryWords: ['merges'],
     });
     const line = content.split('\n').indexOf('MergeTree performs background merges of data parts.');
-    expect(ctx.leaf.openFile).toHaveBeenCalledWith(ctx.file, { eState: { line } });
+    expect(ctx.leaf.openFile).toHaveBeenCalledWith(ctx.file, {
+      eState: {
+        cursor: {
+          from: expect.objectContaining({ line: line }),
+          to: expect.objectContaining({ line: line }),
+        },
+      },
+    });
     expect(ctx.view.editor.setCursor).toHaveBeenCalledWith({ line, ch: 0 });
     expect(ctx.view.editor.setSelection).not.toHaveBeenCalled();
     expect(ctx.view.editor.scrollIntoView).toHaveBeenCalledWith(
@@ -100,18 +113,113 @@ describe('openResultAtAnchor', () => {
     expect(target?.confidence).toBe('offset');
   });
 
-  it('selects only the exact query word for full-text matches', async () => {
+  it('marks only the exact query word for full-text matches, without selecting', async () => {
+    flash.mockClear();
     const ctx = setup('source');
     await openResultAtAnchor(ctx.app as never, ctx.leaf, ctx.file, result('bm25'), {
       mode: 'fulltext',
       queryWords: ['merges'],
     });
-    const line = content.split('\n').indexOf('MergeTree performs background merges of data parts.');
-    const ch = 'MergeTree performs background '.length;
-    expect(ctx.view.editor.setSelection).toHaveBeenCalledWith(
-      { line, ch },
-      { line, ch: ch + 'merges'.length },
+    const wordStart = content.indexOf('merges');
+    expect(ctx.view.editor.setSelection).not.toHaveBeenCalled();
+    expect(flash).toHaveBeenCalledWith(ctx.view, wordStart, wordStart + 6, 'hit', 2000);
+  });
+
+  it('opens a newer engine passage at the exact identifier and marks only it', async () => {
+    flash.mockClear();
+    const ctx = setup('source');
+    const passageStart = body.indexOf('MergeTree performs');
+    const anchor = {
+      ...result('semantic').previewAnchors![0]!,
+      passageStart,
+      passageEnd: passageStart + 'MergeTree performs background merges of data parts.'.length,
+      matchStart: passageStart,
+      matchEnd: passageStart + 'MergeTree'.length,
+    };
+    const target = await openResultAtAnchor(
+      ctx.app as never,
+      ctx.leaf,
+      ctx.file,
+      { ...result(), previewAnchors: [anchor] },
+      { mode: 'hybrid', queryWords: ['mergetree'] },
     );
+    const hit = frontmatter.length + passageStart;
+    expect(target?.confidence).toBe('passage');
+    const line = content.split('\n').indexOf('MergeTree performs background merges of data parts.');
+    expect(ctx.view.editor.setCursor).toHaveBeenCalledWith({ line, ch: 0 });
+    expect(flash).toHaveBeenCalledWith(ctx.view, hit, hit + 'MergeTree'.length, 'hit', 2000);
+  });
+
+  it('semantic mode marks the passage lines, never a word', async () => {
+    flash.mockClear();
+    const ctx = setup('source');
+    const passageStart = body.indexOf('MergeTree performs');
+    const passageEnd = passageStart + 'MergeTree performs background merges of data parts.'.length;
+    const anchor = {
+      ...result('semantic').previewAnchors![0]!,
+      passageStart,
+      passageEnd,
+      matchStart: passageStart,
+      matchEnd: passageStart + 'MergeTree'.length,
+    };
+    await openResultAtAnchor(
+      ctx.app as never,
+      ctx.leaf,
+      ctx.file,
+      { ...result(), previewAnchors: [anchor] },
+      { mode: 'semantic', queryWords: ['mergetree'] },
+    );
+    const base = frontmatter.length;
+    expect(flash).toHaveBeenCalledWith(
+      ctx.view,
+      base + passageStart,
+      base + passageEnd,
+      'passage',
+      2000,
+    );
+  });
+
+  it('does not mark anything when only the chunk could be verified', async () => {
+    flash.mockClear();
+    const repeated = 'Same line.\n\nSame line.';
+    const repeatedContent = `# Notes\n\n${repeated}`;
+    const ctx = setup('source', repeatedContent);
+    ctx.app.vault.cachedRead.mockResolvedValue(repeatedContent);
+    const chunkStart = repeatedContent.indexOf('Same line.');
+    await openResultAtAnchor(
+      ctx.app as never,
+      ctx.leaf,
+      ctx.file,
+      {
+        ...result('bm25'),
+        previewAnchors: [
+          {
+            kind: 'bm25',
+            headingPath: '# Notes',
+            matchText: 'Same line.',
+            charStart: chunkStart - 2,
+            charEnd: repeatedContent.length,
+          },
+        ],
+      },
+      { mode: 'fulltext' },
+    );
+    // The note still opens at the chunk; only the marker is withheld.
+    expect(ctx.view.editor.setCursor).toHaveBeenCalled();
+    expect(flash).not.toHaveBeenCalled();
+  });
+
+  it('opens with a collapsed cursor, never a line or range selection', async () => {
+    const ctx = setup('source');
+    await openResultAtAnchor(ctx.app as never, ctx.leaf, ctx.file, result('bm25'), {
+      mode: 'fulltext',
+      queryWords: ['merges'],
+    });
+    const state = ctx.leaf.openFile.mock.calls[0]![1] as {
+      eState: { line?: number; cursor: { from: unknown; to: unknown } };
+    };
+    expect(state.eState.line).toBeUndefined();
+    expect(state.eState.cursor.to).toEqual(state.eState.cursor.from);
   });
 
   it('re-verifies against unsaved editor content', async () => {

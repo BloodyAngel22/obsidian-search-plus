@@ -20,6 +20,10 @@ import { SearchModal } from './ui/SearchModal';
 import { revealSearchPanel, SEARCH_PANEL_VIEW_TYPE, SearchPanelView } from './ui/SearchPanelView';
 import { SimilarNotesBottomManager } from './ui/SimilarNotesBottom';
 import { runAllCleanupSteps } from './ui/cleanup';
+import {
+  clearNavigationHighlights,
+  navigationHighlightExtension,
+} from './ui/navigation/editorHighlight';
 import { sweepStrayPanels } from './ui/strayPanels';
 
 type SearchMode = 'hybrid' | 'semantic' | 'fulltext' | 'title';
@@ -41,6 +45,8 @@ export default class HybridSearchPlugin extends Plugin {
 
     this.restartClient();
     this.registerEditorSuggest(new InlineSearchSuggest(this.app, this));
+    // Temporary marker for the passage a result opened at (Source mode / Live Preview).
+    this.registerEditorExtension(navigationHighlightExtension());
     this.registerView(SEARCH_PANEL_VIEW_TYPE, (leaf) => new SearchPanelView(leaf, this));
     this.registerView(GRAPH_WORKBENCH_VIEW_TYPE, (leaf) => new GraphWorkbenchView(leaf, this));
     if (typeof this.app.workspace.on === 'function') {
@@ -169,6 +175,7 @@ export default class HybridSearchPlugin extends Plugin {
   onunload(): void {
     try {
       runAllCleanupSteps(
+        () => clearNavigationHighlights(),
         () => this.closeActiveSearchModals(),
         // Unstamped panels are excluded here: by now they can only belong to a live foreign copy.
         () => this.removeOrphanedPanels({ includeUnstamped: false }),

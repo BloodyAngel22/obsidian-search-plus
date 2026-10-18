@@ -1574,17 +1574,14 @@ export class GraphWorkbenchView extends ItemView {
       const content = await this.app.vault.cachedRead(file);
       const startOffset = getAnchorOffset(content, anchor);
       if (startOffset < 0) return undefined;
-      const endOffset =
-        typeof anchor.charEnd === 'number' && anchor.charEnd >= startOffset
-          ? anchor.charEnd
-          : startOffset;
+      // A cursor, not a selection: selecting the rest of the chunk would replace it on
+      // the next keystroke.
       const from = offsetToEditorPosition(content, startOffset);
-      const to = offsetToEditorPosition(content, endOffset);
       return {
         active: true,
         eState: {
           line: from.line,
-          cursor: { from, to },
+          cursor: { from, to: from },
         },
       };
     } catch {

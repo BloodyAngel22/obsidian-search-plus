@@ -8,7 +8,13 @@ import type HybridSearchPlugin from '../main';
 import { FilterBar } from './filters/FilterBar';
 import { describeResults } from './filters/resultStatus';
 import { openResultAtAnchor, type OpenResultOptions } from './navigation/openResult';
-import { getResultContext } from './navigation/resultContext';
+import {
+  appendHighlighted,
+  getResultContext,
+  renderDiagnostics,
+  renderResultContext,
+  rowHighlightWords,
+} from './navigation/resultContext';
 import {
   createInternalLink,
   fileToDragWikiLink,
@@ -311,7 +317,7 @@ export class SearchPanelView extends ItemView {
       const nfcPath = result.path.normalize('NFC');
       const isExpanded = this.expandedPaths.has(nfcPath);
       const item = this.resultsEl.createDiv({
-        cls: `tree-item hybrid-search-panel-result${isExpanded ? '' : ' is-collapsed'}`,
+        cls: `tree-item hybrid-search-panel-result${isExpanded ? '' : ' is-collapsed'}${index === this.selectedIndex ? ' is-selected' : ''}`,
       });
       const row = item.createDiv({
         cls: `tree-item-self hybrid-search-panel-row is-clickable${index === this.selectedIndex ? ' is-selected' : ''}`,
@@ -333,7 +339,9 @@ export class SearchPanelView extends ItemView {
       );
       link.classList.add('tree-item-inner');
       link.addEventListener('mouseover', (evt) => this.handleHoverPreview(evt));
-      if (!this.hideScores) {
+      // Scores only order results (they are not confidence): diagnostics view only.
+      const diagnostics = this.plugin.settings.showSearchDiagnostics;
+      if (diagnostics && !this.hideScores) {
         const flairOuter = row.createDiv({ cls: 'tree-item-flair-outer' });
         const scoreEl = flairOuter.createSpan({
           cls: 'tree-item-flair hybrid-search-panel-score',
@@ -341,29 +349,8 @@ export class SearchPanelView extends ItemView {
         });
         scoreEl.style.color = scoreColor(result.score);
       }
-      const heading = getResultContext(result).heading;
-      if (heading) {
-        item.createDiv({
-          cls: 'search-plus-result-heading hybrid-search-panel-heading',
-          text: heading,
-          attr: { title: heading },
-        });
-      }
-      if (this.plugin.settings.showMeta) {
-        const folder = result.path.includes('/') ? result.path.replace(/\/[^/]+$/, '') : '';
-        if (folder) item.createDiv({ cls: 'hybrid-search-panel-meta', text: folder });
-      }
-      if (isExpanded && result.snippet) {
-        const matches = item.createDiv({ cls: 'search-result-file-matches' });
-        const match = matches.createDiv({
-          cls: 'search-result-file-match tappable hybrid-search-panel-snippet',
-        });
-        match.dataset.index = String(index);
-        match.setAttribute('role', 'button');
-        match.setAttribute('tabindex', '0');
-        match.setAttribute('aria-label', `Open ${title} at matching snippet`);
-        match.textContent = result.snippet;
-      }
+      this.renderResultBody(item, result, index, title, isExpanded);
+      if (diagnostics) renderDiagnostics(item, result).addClass('hybrid-search-panel-context');
     }
     const meta = this.metadataPaging?.meta;
     if (meta?.hasMore && typeof meta.nextOffset === 'number') {
@@ -373,6 +360,45 @@ export class SearchPanelView extends ItemView {
         attr: { type: 'button' },
       });
       more.addEventListener('click', () => void this.loadMore());
+    }
+  }
+
+  /**
+   * Same title → heading → snippet layout as the modal; expanding shows the whole
+   * passage snippet as a button that opens the note there.
+   */
+  private renderResultBody(
+    item: HTMLElement,
+    result: SearchResult,
+    index: number,
+    title: string,
+    isExpanded: boolean,
+  ): void {
+    const highlight = rowHighlightWords(
+      result,
+      this.openOptions.mode ?? '',
+      this.openOptions.queryWords ?? [],
+    );
+    const context = getResultContext(result, isExpanded ? 2000 : undefined);
+    renderResultContext(
+      item,
+      isExpanded ? { heading: context.heading, snippet: null } : context,
+      highlight,
+    )?.addClass('hybrid-search-panel-context');
+    if (this.plugin.settings.showMeta) {
+      const folder = result.path.includes('/') ? result.path.replace(/\/[^/]+$/, '') : '';
+      if (folder) item.createDiv({ cls: 'hybrid-search-panel-meta', text: folder });
+    }
+    if (isExpanded && context.snippet) {
+      const matches = item.createDiv({ cls: 'search-result-file-matches' });
+      const match = matches.createDiv({
+        cls: 'search-result-file-match tappable hybrid-search-panel-snippet',
+      });
+      match.dataset.index = String(index);
+      match.setAttribute('role', 'button');
+      match.setAttribute('tabindex', '0');
+      match.setAttribute('aria-label', `Open ${title} at matching snippet`);
+      appendHighlighted(match, context.snippet, highlight ?? []);
     }
   }
 
