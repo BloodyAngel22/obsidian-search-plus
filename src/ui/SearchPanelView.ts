@@ -1,6 +1,12 @@
 import { ItemView, Notice, setIcon, TFile, type WorkspaceLeaf } from 'obsidian';
-import type { SearchResult } from '../ipc';
+import { EngineCapabilityCache } from '../filters/engineCompat';
+import { hasActiveFilters } from '../filters/filterState';
+import { SearchCoordinator } from '../filters/searchCoordinator';
+import { buildSearchRequest, type SearchRequest } from '../filters/searchRequest';
+import type { SearchMeta, SearchResult } from '../ipc';
 import type HybridSearchPlugin from '../main';
+import { FilterBar } from './filters/FilterBar';
+import { describeResults } from './filters/resultStatus';
 import {
   createInternalLink,
   fileToDragWikiLink,
@@ -17,7 +23,6 @@ import {
   type SearchMode,
   type SuperchargedWatch,
 } from './noteUtils';
-import { applyCustomPostfixes, applyDefaultFilters, parseQuery } from './queryParser';
 
 export const SEARCH_PANEL_VIEW_TYPE = 'hybrid-search-panel';
 const SEARCH_PANEL_SNIPPET_LENGTH = 400;
@@ -44,6 +49,12 @@ export class SearchPanelView extends ItemView {
    *  Held on the view (not folded into `panelMode`) so mode cycling re-renders the badge
    *  through the same helper and cannot overwrite the `~` with a stale mode letter. */
   private similarPath: string | null = null;
+  private filterBar?: FilterBar;
+  private unsubscribeFilters?: () => void;
+  private coordinator: SearchCoordinator;
+  private hideScores = false;
+  /** Current metadata-only request and its paging state, for "Load more". */
+  private metadataPaging?: { request: SearchRequest; meta?: SearchMeta };
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -53,6 +64,10 @@ export class SearchPanelView extends ItemView {
     this.panelMode = plugin.settings.defaultMode;
     this.panelLimit = plugin.settings.searchPanelLimit;
     this.panelThreshold = plugin.settings.searchPanelThreshold;
+    this.coordinator = new SearchCoordinator(
+      () => this.plugin.client,
+      plugin.filterServices?.capabilities ?? new EngineCapabilityCache(),
+    );
   }
 
   getViewType(): string {
@@ -90,6 +105,18 @@ export class SearchPanelView extends ItemView {
     this.modeEl.setAttribute('aria-label', 'Search mode');
     this.modeEl.setAttribute('title', 'Search mode. Select to cycle modes.');
     this.createToolbarButton(inputWrap, 'settings', 'Search options', () => this.toggleOptions());
+    const services = this.plugin.filterServices;
+    if (services) {
+      this.filterBar = new FilterBar(container, {
+        app: this.app,
+        store: services.store,
+        catalog: services.catalog,
+        metadataMenu: services.metadataMenu,
+        mode: { get: () => this.panelMode, set: (mode) => this.setMode(mode) },
+        focusSearch: () => this.inputEl.focus(),
+      });
+      this.unsubscribeFilters = services.store.subscribe(() => this.scheduleSearch());
+    }
     this.optionsEl = container.createDiv({ cls: 'hybrid-search-panel-options is-hidden' });
     this.optionsEl.hide();
     this.expandAllButtonEl = this.createToolbarButton(
@@ -145,13 +172,22 @@ export class SearchPanelView extends ItemView {
       'hybrid-search-panel-row',
     );
     this.inputEl.focus();
+    // Persisted filters describe a result set even before anything is typed.
+    if (hasActiveFilters(this.plugin.filterServices?.store.getRows() ?? [])) {
+      void this.search('');
+    }
   }
 
   async onClose(): Promise<void> {
     await Promise.resolve();
     this.closed = true;
     this.requestId++;
+    this.coordinator.cancel();
     if (this.debounce !== undefined) window.clearTimeout(this.debounce);
+    this.unsubscribeFilters?.();
+    this.unsubscribeFilters = undefined;
+    this.filterBar?.destroy();
+    this.filterBar = undefined;
     unhookSuperchargedLinks(this.app, this.slWatch);
   }
 
@@ -164,17 +200,40 @@ export class SearchPanelView extends ItemView {
   }
 
   private async search(rawQuery: string): Promise<void> {
-    const query = rawQuery.trim();
     const requestId = ++this.requestId;
     this.selectedIndex = -1;
     this.expandedPaths.clear();
     this.allExpanded = false;
-    if (!query) {
+    this.metadataPaging = undefined;
+    this.filterBar?.setFooterAction(null);
+    const rows = this.plugin.filterServices?.store.getRows() ?? [];
+    const activePath = this.app.workspace.getActiveFile()?.path;
+    const request = buildSearchRequest({
+      rawQuery,
+      mode: this.panelMode,
+      rows,
+      customPostfixes: this.plugin.settings.customPostfixes,
+      defaultSearchFilters: this.plugin.settings.defaultSearchFilters,
+      resolveSimilar: (target) =>
+        resolveSimilarTarget(this.app, target, activePath, activePath ?? ''),
+      limit: this.panelLimit,
+      threshold: this.panelThreshold,
+      snippetLength: SEARCH_PANEL_SNIPPET_LENGTH,
+      anchors: true,
+      pageSize: this.panelLimit,
+    });
+    this.similarPath = request.notePath;
+    if (request.kind === 'empty') {
+      this.coordinator.cancel();
       this.results = [];
+      this.hideScores = false;
       // `similarPath` describes the results currently on screen; an empty query has none,
       // so leaving it set would let a later setMode paint a "~" the panel is not honouring.
       this.similarPath = null;
       this.updateModeBadge(this.panelMode, false);
+      this.filterBar?.setStatus(
+        rows.length > 0 && !hasActiveFilters(rows) ? 'Filters are incomplete.' : '',
+      );
       this.renderEmpty('Type to search.');
       return;
     }
@@ -183,52 +242,55 @@ export class SearchPanelView extends ItemView {
       this.renderEmpty('Search client not ready.');
       return;
     }
-
-    this.renderEmpty('Searching...');
-    const { query: parsedQuery, overrides } = parseQuery(
-      applyDefaultFilters(
-        applyCustomPostfixes(query, this.plugin.settings.customPostfixes),
-        this.plugin.settings.defaultSearchFilters,
-      ),
-    );
-    const activePath = this.app.workspace.getActiveFile()?.path;
-    this.similarPath = overrides.similar
-      ? resolveSimilarTarget(this.app, overrides.similar, activePath, activePath ?? '')
-      : null;
-    if (overrides.similar && !this.similarPath) {
+    if (request.kind === 'similar-unavailable') {
       this.results = [];
       this.renderEmpty('Open a note to use @similar.');
       return;
     }
-    const mode = overrides.mode ?? this.panelMode;
-    this.updateModeBadge(mode, overrides.rerank ?? false);
-    const limit = overrides.limit ?? this.panelLimit;
-    const threshold = overrides.threshold ?? this.panelThreshold;
-    try {
-      // The backend ignores the query string during a path lookup, so send '' rather than
-      // the leftover free text — it would only look like it had been searched for.
-      const results = await this.plugin.client.search(this.similarPath ? '' : parsedQuery, {
-        mode,
-        ...(this.similarPath && { notePath: this.similarPath }),
-        limit,
-        anchors: true,
-        snippetLength: SEARCH_PANEL_SNIPPET_LENGTH,
-        ...(overrides.tag !== undefined && { tag: overrides.tag }),
-        ...(overrides.scope !== undefined && { scope: overrides.scope }),
-        ...(overrides.frontmatter !== undefined && { frontmatter: overrides.frontmatter }),
-        ...(overrides.rerank !== undefined && { rerank: overrides.rerank }),
-        ...(threshold > 0 && { threshold }),
-      });
-      if (this.closed || requestId !== this.requestId) return;
-      this.results = [...results].sort((a, b) => b.score - a.score);
-      this.selectedIndex = this.results.length > 0 ? 0 : -1;
-      this.renderResults();
-    } catch {
-      if (!this.closed && requestId === this.requestId) {
-        this.results = [];
-        this.renderEmpty('Search failed.');
-      }
+
+    this.renderEmpty('Searching...');
+    this.updateModeBadge(request.mode, request.rerank);
+    const outcome = await this.coordinator.run(request);
+    if (this.closed || requestId !== this.requestId || outcome.status === 'stale') return;
+    if (outcome.status !== 'ok') {
+      this.results = [];
+      this.filterBar?.setStatus(
+        outcome.status === 'incompatible' ? 'Engine update needed.' : 'Search failed.',
+        'error',
+      );
+      this.renderEmpty(outcome.status === 'incompatible' ? outcome.message : 'Search failed.');
+      if (outcome.status === 'error') console.error('Search Plus: search failed.', outcome.message);
+      return;
     }
+    this.hideScores = request.kind === 'metadata';
+    this.results = [...outcome.results].sort((a, b) => b.score - a.score);
+    this.selectedIndex = this.results.length > 0 ? 0 : -1;
+    if (request.kind === 'metadata') {
+      this.metadataPaging = { request, meta: outcome.meta };
+    }
+    this.filterBar?.setStatus(
+      request.usesStructuredFilters || request.kind === 'metadata'
+        ? describeResults(this.results.length, outcome.meta)
+        : '',
+    );
+    this.renderResults();
+  }
+
+  private async loadMore(): Promise<void> {
+    const paging = this.metadataPaging;
+    const offset = paging?.meta?.nextOffset;
+    if (!paging || typeof offset !== 'number') return;
+    const requestId = this.requestId;
+    const outcome = await this.coordinator.run(paging.request, offset);
+    if (this.closed || requestId !== this.requestId || this.metadataPaging !== paging) return;
+    if (outcome.status !== 'ok') {
+      if (outcome.status !== 'stale') this.filterBar?.setStatus(outcome.message, 'error');
+      return;
+    }
+    this.results = [...this.results, ...outcome.results];
+    this.metadataPaging = { request: paging.request, meta: outcome.meta };
+    this.filterBar?.setStatus(describeResults(this.results.length, outcome.meta));
+    this.renderResults();
   }
 
   private renderEmpty(text: string): void {
@@ -270,12 +332,14 @@ export class SearchPanelView extends ItemView {
       );
       link.classList.add('tree-item-inner');
       link.addEventListener('mouseover', (evt) => this.handleHoverPreview(evt));
-      const flairOuter = row.createDiv({ cls: 'tree-item-flair-outer' });
-      const scoreEl = flairOuter.createSpan({
-        cls: 'tree-item-flair hybrid-search-panel-score',
-        text: result.score.toFixed(2),
-      });
-      scoreEl.style.color = scoreColor(result.score);
+      if (!this.hideScores) {
+        const flairOuter = row.createDiv({ cls: 'tree-item-flair-outer' });
+        const scoreEl = flairOuter.createSpan({
+          cls: 'tree-item-flair hybrid-search-panel-score',
+          text: result.score.toFixed(2),
+        });
+        scoreEl.style.color = scoreColor(result.score);
+      }
       if (this.plugin.settings.showMeta) {
         const folder = result.path.includes('/') ? result.path.replace(/\/[^/]+$/, '') : '';
         if (folder) item.createDiv({ cls: 'hybrid-search-panel-meta', text: folder });
@@ -291,6 +355,15 @@ export class SearchPanelView extends ItemView {
         match.setAttribute('aria-label', `Open ${title} at matching snippet`);
         match.textContent = result.snippet;
       }
+    }
+    const meta = this.metadataPaging?.meta;
+    if (meta?.hasMore && typeof meta.nextOffset === 'number') {
+      const more = this.resultsEl.createEl('button', {
+        cls: 'search-plus-load-more mod-muted',
+        text: 'Load more',
+        attr: { type: 'button' },
+      });
+      more.addEventListener('click', () => void this.loadMore());
     }
   }
 
@@ -399,14 +472,22 @@ export class SearchPanelView extends ItemView {
     }
     if (evt.key === 'Escape') {
       evt.preventDefault();
-      this.inputEl.value = '';
-      this.results = [];
-      this.expandedPaths.clear();
-      // Escape discards the results without going through search(), so clear the similar
-      // state here too — otherwise the badge keeps claiming "~" for results that are gone.
-      this.similarPath = null;
-      this.updateModeBadge(this.panelMode, false);
-      this.renderEmpty('Type to search.');
+      this.clearQuery();
+    }
+  }
+
+  private clearQuery(): void {
+    this.inputEl.value = '';
+    this.results = [];
+    this.expandedPaths.clear();
+    // Escape discards the results without going through search(), so clear the similar
+    // state here too — otherwise the badge keeps claiming "~" for results that are gone.
+    this.similarPath = null;
+    this.updateModeBadge(this.panelMode, false);
+    this.renderEmpty('Type to search.');
+    // Active filters still describe a result set without any text.
+    if (hasActiveFilters(this.plugin.filterServices?.store.getRows() ?? [])) {
+      void this.search('');
     }
   }
 
@@ -503,7 +584,12 @@ export class SearchPanelView extends ItemView {
       this.plugin.settings.searchPanelThreshold = this.panelThreshold;
       void this.plugin.saveSettings();
     }
-    if (this.inputEl.value.trim()) void this.search(this.inputEl.value);
+    if (
+      this.inputEl.value.trim() ||
+      hasActiveFilters(this.plugin.filterServices?.store.getRows() ?? [])
+    ) {
+      void this.search(this.inputEl.value);
+    }
   }
 
   private toggleResult(index: number): void {
@@ -557,8 +643,12 @@ export class SearchPanelView extends ItemView {
   setMode(mode: SearchMode): void {
     this.panelMode = mode;
     this.updateModeBadge(mode, false);
-    if (this.inputEl?.value.trim()) {
-      void this.search(this.inputEl.value);
+    this.filterBar?.setMode(mode);
+    if (
+      this.inputEl?.value.trim() ||
+      hasActiveFilters(this.plugin.filterServices?.store.getRows() ?? [])
+    ) {
+      void this.search(this.inputEl?.value ?? '');
     }
     this.inputEl?.focus();
   }

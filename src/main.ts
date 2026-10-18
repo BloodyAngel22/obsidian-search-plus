@@ -1,4 +1,9 @@
 import { Notice, Plugin, type EventRef } from 'obsidian';
+import { EngineCapabilityCache } from './filters/engineCompat';
+import { FilterStore } from './filters/filterStore';
+import { MetadataCatalog } from './filters/metadataCatalog';
+import { MetadataMenuAdapter } from './filters/metadataMenu';
+import type { FilterServices } from './filters/services';
 import type { HttpSearchClientStatusEvent } from './ipc';
 import { HttpSearchClient, SearchClient } from './ipc';
 import { getApiKey, getLegacyApiKeySecretId } from './secrets';
@@ -26,10 +31,13 @@ export default class HybridSearchPlugin extends Plugin {
   private pagePreviewSimilarNotes?: PagePreviewSimilarNotesManager;
   private graphWorkbenchRefreshTimer?: number;
   private activeSearchModals = new Set<SearchModal>();
+  /** Shared by SearchModal and SearchPanelView so both use one filter state. */
+  filterServices!: FilterServices;
 
   async onload(): Promise<void> {
     this.removeOrphanedPanels({ includeUnstamped: true });
     await this.loadSettings();
+    this.setupFilterServices();
 
     this.restartClient();
     this.registerEditorSuggest(new InlineSearchSuggest(this.app, this));
@@ -172,6 +180,8 @@ export default class HybridSearchPlugin extends Plugin {
         },
         () => this.pagePreviewSimilarNotes?.unload(),
         () => this.similarNotesBottom?.unload(),
+        () => this.filterServices?.store.flush(),
+        () => this.filterServices?.catalog.stop(),
         () => this.client?.dispose(),
       );
     } catch (error) {
@@ -190,6 +200,7 @@ export default class HybridSearchPlugin extends Plugin {
       forcedMode,
       onDidClose: (closedModal) => this.activeSearchModals.delete(closedModal),
       ownerId: this.manifest.id,
+      filters: this.filterServices,
     });
     this.activeSearchModals.add(modal);
     modal.open();
@@ -217,8 +228,27 @@ export default class HybridSearchPlugin extends Plugin {
     sweepStrayPanels(documents, { ownerId: this.manifest.id, includeUnstamped });
   }
 
+  private setupFilterServices(): void {
+    const catalog = new MetadataCatalog(this.app);
+    this.filterServices = {
+      store: new FilterStore(this.settings.metadataFilters, async (state) => {
+        this.settings.metadataFilters = state;
+        await this.saveSettings();
+      }),
+      catalog,
+      metadataMenu: new MetadataMenuAdapter(this.app),
+      capabilities: new EngineCapabilityCache(),
+    };
+    // The vault scan is deferred until the workspace is ready and runs in batches.
+    const workspace = this.app.workspace as { onLayoutReady?: (cb: () => void) => void };
+    if (typeof workspace.onLayoutReady === 'function')
+      workspace.onLayoutReady(() => catalog.start());
+    else catalog.start();
+  }
+
   restartClient(): void {
     this.client?.dispose();
+    this.filterServices?.capabilities.reset();
     let startupFailureCoveredByStatus = false;
     this.client =
       this.settings.transport === 'http'

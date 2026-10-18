@@ -45,7 +45,54 @@ export class MetadataCache {
   }
 }
 
+type KeymapHandler = (evt: KeyboardEvent, ctx: unknown) => boolean | void;
+
+/** Minimal Scope: first matching handler wins, unmatched keys fall back to the parent. */
+export class Scope {
+  keys: Array<{ modifiers: string[]; key: string; func: KeymapHandler }> = [];
+  constructor(public parent?: Scope | { register?: unknown }) {}
+  register(modifiers: string[], key: string, func: KeymapHandler) {
+    const entry = { modifiers, key, func };
+    this.keys.push(entry);
+    return entry;
+  }
+  unregister(entry: unknown) {
+    this.keys = this.keys.filter((k) => k !== entry);
+  }
+  /** Test helper mirroring Obsidian's dispatch for plain (modifier-less) keys. */
+  handleKey(evt: KeyboardEvent): boolean | void {
+    const mods: string[] = [];
+    if (evt.ctrlKey || evt.metaKey) mods.push('Mod');
+    if (evt.altKey) mods.push('Alt');
+    if (evt.shiftKey) mods.push('Shift');
+    const match = this.keys.find(
+      (k) =>
+        k.key === evt.key &&
+        k.modifiers.length === mods.length &&
+        k.modifiers.every((m) => mods.includes(m)),
+    );
+    if (match) {
+      const result = match.func(evt, {});
+      if (result === false) evt.preventDefault();
+      return result;
+    }
+    const parent = this.parent as Scope | undefined;
+    return typeof parent?.handleKey === 'function' ? parent.handleKey(evt) : undefined;
+  }
+}
+
+export class Keymap {
+  scopes: Scope[] = [];
+  pushScope(scope: Scope) {
+    this.scopes.push(scope);
+  }
+  popScope(scope: Scope) {
+    this.scopes = this.scopes.filter((s) => s !== scope);
+  }
+}
+
 export class App {
+  keymap: Keymap = new Keymap();
   workspace: Workspace = new Workspace();
   metadataCache: MetadataCache = new MetadataCache();
   vault = {

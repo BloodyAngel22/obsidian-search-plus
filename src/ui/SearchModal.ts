@@ -7,9 +7,16 @@ import {
   SuggestModal,
   TFile,
 } from 'obsidian';
-import type { MatchAnchor, SearchClient, SearchResult } from '../ipc';
+import { EngineCapabilityCache } from '../filters/engineCompat';
+import { hasActiveFilters } from '../filters/filterState';
+import { SearchCoordinator, type CoordinatorClient } from '../filters/searchCoordinator';
+import { buildSearchRequest, type SearchRequest } from '../filters/searchRequest';
+import type { FilterServices } from '../filters/services';
+import type { MatchAnchor, SearchMeta, SearchResult } from '../ipc';
 import type { HybridSearchSettings } from '../settings';
 import { runAllCleanupSteps } from './cleanup';
+import { FilterBar } from './filters/FilterBar';
+import { describeResults } from './filters/resultStatus';
 import { GraphPanel } from './GraphPanel';
 import { hookInternalLinks } from './linkHandler';
 import { registerModalKeymap } from './modalKeymap';
@@ -26,12 +33,13 @@ import {
   unhookSuperchargedLinks,
   type SuperchargedWatch,
 } from './noteUtils';
-import { applyCustomPostfixes, applyDefaultFilters, parseQuery } from './queryParser';
 import { createBodyPanel } from './strayPanels';
 
 type SearchMode = 'hybrid' | 'semantic' | 'fulltext' | 'title';
 
 const RECENT_FILES_LIMIT = 20; // local cap for recent-files list only
+/** Page size for metadata-only (filter-only) results in the modal. */
+const METADATA_PAGE_SIZE = 50;
 
 export interface SearchModalOptions {
   /** Path of the note that was active when the modal opened, used by the "~" scope. */
@@ -42,6 +50,8 @@ export interface SearchModalOptions {
   onDidClose?: (modal: SearchModal) => void;
   /** Plugin instance id stamped onto panels outside the component tree, see `strayPanels.ts`. */
   ownerId?: string;
+  /** Shared metadata filter state and services; the filter bar is hidden without it. */
+  filters?: FilterServices;
 }
 
 export class SearchModal extends SuggestModal<SearchResult> {
@@ -60,6 +70,15 @@ export class SearchModal extends SuggestModal<SearchResult> {
 
   private modeEl?: HTMLSpanElement;
   private graphPanel?: GraphPanel;
+  private filterBar?: FilterBar;
+  private unsubscribeFilters?: () => void;
+  private coordinator: SearchCoordinator;
+  /** Mode picked in the filter bar; a mode typed in the query still wins. */
+  private sessionMode: SearchMode;
+  /** Metadata-only pages loaded so far, reused once by "Load more". */
+  private metadataPages?: { key: string; results: SearchResult[]; meta?: SearchMeta };
+  private reuseMetadataPages = false;
+  private hideScores = false;
 
   private readonly debouncedPreview = debounce(
     (path: string, snippet?: string, anchors?: MatchAnchor[], primaryIdx?: number) => {
@@ -73,10 +92,11 @@ export class SearchModal extends SuggestModal<SearchResult> {
   private readonly forcedMode?: SearchMode;
   private readonly onDidClose?: (modal: SearchModal) => void;
   private readonly ownerId?: string;
+  private readonly filters?: FilterServices;
 
   constructor(
     app: App,
-    private client: Pick<SearchClient, 'search'>,
+    private client: CoordinatorClient,
     private settings: HybridSearchSettings,
     private readonly saveSettings: () => Promise<void>,
     options: SearchModalOptions = {},
@@ -86,12 +106,20 @@ export class SearchModal extends SuggestModal<SearchResult> {
     this.forcedMode = options.forcedMode;
     this.onDidClose = options.onDidClose;
     this.ownerId = options.ownerId;
+    this.filters = options.filters;
+    this.sessionMode = this.forcedMode ?? this.settings.defaultMode;
+    this.coordinator = new SearchCoordinator(
+      () => this.client,
+      // Without shared services (tests, old callers) the cache is private to this modal.
+      options.filters?.capabilities ?? new EngineCapabilityCache(),
+    );
     this.setPlaceholder('Hybrid search: type to search your vault...');
   }
 
   open(): void {
     super.open();
     this.injectModeBadge();
+    this.injectFilterBar();
     this.hookSuperchargedLinks();
     registerModalKeymap(this, this.app, this.settings, this.saveSettings);
     this.graphPanel?.unload();
@@ -122,6 +150,36 @@ export class SearchModal extends SuggestModal<SearchResult> {
       cls: 'hybrid-search-mode-badge',
       text: initialLabel,
     });
+  }
+
+  private injectFilterBar(): void {
+    if (!this.filters) return;
+    const results = (this as unknown as { resultContainerEl?: HTMLElement }).resultContainerEl;
+    const host = results?.parentElement ?? this.modalEl;
+    this.filterBar = new FilterBar(host, {
+      app: this.app,
+      store: this.filters.store,
+      catalog: this.filters.catalog,
+      metadataMenu: this.filters.metadataMenu,
+      mode: {
+        get: () => this.sessionMode,
+        set: (mode) => {
+          this.sessionMode = mode;
+          this.refreshSuggestions();
+          this.inputEl.focus();
+        },
+      },
+      keyScope: { parent: this.scope, onEscape: () => this.close() },
+      focusSearch: () => this.inputEl.focus(),
+    });
+    if (results && results.parentElement === host) host.insertBefore(this.filterBar.el, results);
+    this.modalEl.addClass('search-plus-has-filter-bar');
+    this.unsubscribeFilters = this.filters.store.subscribe(() => this.refreshSuggestions());
+  }
+
+  /** Re-run the current query (SuggestModal re-queries on its input event). */
+  private refreshSuggestions(): void {
+    this.inputEl.dispatchEvent(new Event('input'));
   }
 
   private updateModeBadge(label: string): void {
@@ -286,6 +344,9 @@ export class SearchModal extends SuggestModal<SearchResult> {
     this.graphPanel = undefined;
     runAllCleanupSteps(
       () => this.cancelPendingSuggestions(),
+      () => this.coordinator.cancel(),
+      () => this.unsubscribeFilters?.(),
+      () => this.filterBar?.destroy(),
       () => {
         if (this.settings.rememberLastQuery && this.inputEl) {
           this.settings.lastQuery = this.inputEl.value.trim();
@@ -310,7 +371,28 @@ export class SearchModal extends SuggestModal<SearchResult> {
     // query — including the empty-query paths (similar-to-active, recent files), which
     // return before any later reset would run.
     this.emptyStateText = 'No results found.';
-    if (!query.trim()) {
+    this.hideScores = false;
+    const rows = this.filters?.store.getRows() ?? [];
+    const request = buildSearchRequest({
+      rawQuery: query,
+      mode: this.sessionMode,
+      rows,
+      customPostfixes: this.settings.customPostfixes,
+      defaultSearchFilters: this.settings.defaultSearchFilters,
+      // `@similar` resolves against the snapshot taken when the modal opened — the same
+      // source of truth the empty-query `~` mode uses.
+      resolveSimilar: (target) =>
+        resolveSimilarTarget(this.app, target, this.activePath, this.activePath ?? ''),
+      snippetLength: this.settings.showPreview && this.settings.scrollToSnippet ? 400 : 0,
+      anchors: this.settings.showPreview && this.settings.scrollToSnippet,
+      pageSize: METADATA_PAGE_SIZE,
+    });
+
+    if (request.kind === 'empty') {
+      this.metadataPages = undefined;
+      this.setFilterStatus(
+        rows.length > 0 && !hasActiveFilters(rows) ? 'Filters are incomplete.' : '',
+      );
       if (this.activePath) {
         // Active note open: show semantically similar notes
         this.isRecentMode = false;
@@ -324,61 +406,85 @@ export class SearchModal extends SuggestModal<SearchResult> {
     }
     this.isRecentMode = false;
 
-    const { query: parsedQuery, overrides } = parseQuery(
-      applyDefaultFilters(
-        applyCustomPostfixes(query, this.settings.customPostfixes),
-        this.settings.defaultSearchFilters,
-      ),
-    );
-    // `@similar` resolves against the snapshot taken when the modal opened — the same
-    // source of truth the empty-query `~` mode uses. Computed here, outside the debounce
-    // closure below, so the badge and the request agree on one resolution.
-    const notePath = overrides.similar
-      ? resolveSimilarTarget(this.app, overrides.similar, this.activePath, this.activePath ?? '')
-      : null;
-
-    if (overrides.similar && !notePath) {
+    if (request.kind === 'similar-unavailable') {
       this.emptyStateText = 'Open a note to use @similar.';
       this.updateModeBadge('~');
       return [];
     }
 
-    this.currentMode = overrides.mode ?? this.forcedMode ?? this.settings.defaultMode;
-    // With a notePath the free text was never sent to the backend, so highlighting it in the
-    // preview would mark words that had no influence on the results.
-    this.currentQueryWords = notePath
-      ? []
-      : parsedQuery
-          .split(/\s+/)
-          .map((w) => w.toLowerCase().replace(/[^\p{L}\p{N}]/gu, ''))
-          .filter((w) => w.length >= 2);
-    this.updateModeBadge(
-      notePath
-        ? '~'
-        : modeLabel(
-            overrides.mode ?? this.forcedMode ?? this.settings.defaultMode,
-            overrides.rerank ?? false,
-          ),
-    );
+    this.currentMode = request.mode;
+    this.currentQueryWords = request.queryWords;
+    this.hideScores = request.kind === 'metadata';
+    this.updateModeBadge(request.notePath ? '~' : modeLabel(request.mode, request.rerank));
 
-    return this.scheduleSuggestions(() =>
-      this.client
-        // The backend ignores the query string during a path lookup, so send '' rather
-        // than the leftover free text — it would only look like it had been searched for.
-        .search(notePath ? '' : parsedQuery, {
-          mode: overrides.mode ?? this.forcedMode ?? this.settings.defaultMode,
-          ...(notePath && { notePath }),
-          ...(overrides.limit !== undefined && { limit: overrides.limit }),
-          snippetLength: this.settings.showPreview && this.settings.scrollToSnippet ? 400 : 0,
-          anchors: this.settings.showPreview && this.settings.scrollToSnippet,
-          ...(overrides.tag !== undefined && { tag: overrides.tag }),
-          ...(overrides.scope !== undefined && { scope: overrides.scope }),
-          ...(overrides.frontmatter !== undefined && { frontmatter: overrides.frontmatter }),
-          ...(overrides.rerank !== undefined && { rerank: overrides.rerank }),
-          ...(overrides.threshold !== undefined && { threshold: overrides.threshold }),
-        })
-        .then((results) => [...results].sort(byScoreDesc)),
-    );
+    if (this.reuseMetadataPages && this.metadataPages && this.metadataPages.key === request.key) {
+      this.reuseMetadataPages = false;
+      this.updateMetadataFooter(request);
+      return this.metadataPages.results;
+    }
+    this.reuseMetadataPages = false;
+    this.metadataPages = undefined;
+
+    return this.scheduleSuggestions(async () => {
+      const outcome = await this.coordinator.run(request);
+      if (outcome.status === 'stale') return [];
+      if (outcome.status !== 'ok') {
+        this.emptyStateText = outcome.message;
+        this.setFilterStatus(
+          outcome.status === 'incompatible' ? 'Engine update needed.' : 'Search failed.',
+          'error',
+        );
+        this.filterBar?.setFooterAction(null);
+        return [];
+      }
+      const results = [...outcome.results].sort(byScoreDesc);
+      if (request.kind === 'metadata') {
+        this.metadataPages = { key: request.key, results, meta: outcome.meta };
+        this.updateMetadataFooter(request);
+      } else {
+        this.filterBar?.setFooterAction(null);
+        this.setFilterStatus(
+          request.usesStructuredFilters ? describeResults(results.length, outcome.meta) : '',
+        );
+      }
+      return results;
+    });
+  }
+
+  private setFilterStatus(text: string, tone: 'normal' | 'error' = 'normal'): void {
+    this.filterBar?.setStatus(text, tone);
+  }
+
+  private updateMetadataFooter(request: SearchRequest): void {
+    const pages = this.metadataPages;
+    if (!pages) return;
+    this.setFilterStatus(describeResults(pages.results.length, pages.meta));
+    const nextOffset = pages.meta?.nextOffset;
+    if (pages.meta?.hasMore && typeof nextOffset === 'number') {
+      this.filterBar?.setFooterAction('Load more', () => void this.loadMore(request, nextOffset));
+    } else {
+      this.filterBar?.setFooterAction(null);
+    }
+  }
+
+  private async loadMore(request: SearchRequest, offset: number): Promise<void> {
+    const pages = this.metadataPages;
+    if (!pages || pages.key !== request.key) return;
+    this.filterBar?.setFooterAction('Loading...', () => {});
+    const outcome = await this.coordinator.run(request, offset);
+    if (outcome.status !== 'ok' || this.metadataPages !== pages) {
+      if (outcome.status === 'error' || outcome.status === 'incompatible') {
+        this.setFilterStatus(outcome.message, 'error');
+      }
+      return;
+    }
+    this.metadataPages = {
+      key: pages.key,
+      results: [...pages.results, ...outcome.results],
+      meta: outcome.meta,
+    };
+    this.reuseMetadataPages = true;
+    this.refreshSuggestions();
   }
 
   private scheduleSuggestions(load: () => Promise<SearchResult[]>): Promise<SearchResult[]> {
@@ -454,7 +560,7 @@ export class SearchModal extends SuggestModal<SearchResult> {
       'hybrid-search-name',
     );
 
-    if (!this.isRecentMode) {
+    if (!this.isRecentMode && !this.hideScores) {
       titleRow.createSpan({
         text: score.toFixed(2),
         cls: 'hybrid-search-score',

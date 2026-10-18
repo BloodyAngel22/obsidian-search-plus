@@ -114,6 +114,22 @@ zettelkasten #project @limit:20 @rerank @hybrid
 | `key:value`           | None                     | Filter by frontmatter field                 |
 | `-key:value`          | None                     | Exclude by frontmatter field                |
 
+## Metadata filters
+
+Both the search modal and the search panel have a compact filter bar under the search field: a mode dropdown and **+ Filter**.
+
+1. Select **+ Filter** and type to find a property. The list shows the YAML properties used in this vault (read from Obsidian's metadata cache) with note counts.
+2. Pick a property. A filter row appears and its value list opens. Select one or more values (they are combined with OR), or type a value that no note has yet and press Enter.
+3. Change the condition with the dropdown: **is any of**, **is none of**, **exists**, **is missing**.
+
+Rows for different properties are combined with AND, and with any operators typed in the query (for example `status:done #pkm`). Filters apply inside the engine before the result limit, in every search mode. With filters and an empty query, the search lists all matching notes with an exact count and a **Load more** button.
+
+A row with a dashed border is incomplete (no value yet) and does not restrict results. A row marked in orange has values no note currently uses; the values stay selected until you remove them. Filters are saved and shared between the modal and the panel.
+
+Values are typed like in YAML: `1` (number) and `"1"` (text) are different values. Only YAML frontmatter is used; inline `key:: value` fields are not filterable. Metadata Menu is optional: when it is installed, its Select/Multi/Boolean field definitions add value suggestions, but matching always uses the YAML values the engine indexed.
+
+Metadata filters need an engine that reports the `structuredFiltersV1` capability (`ohs capabilities`). With an older engine the plugin shows an "engine update needed" message instead of unfiltered results.
+
 ## Hotkeys
 
 | Hotkey            | Action                            |

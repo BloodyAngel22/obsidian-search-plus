@@ -1,4 +1,6 @@
 import { App, Notice, PluginSettingTab, SecretComponent, Setting, setIcon } from 'obsidian';
+import { EMPTY_FILTER_STATE, normalizeFilterState } from './filters/filterState';
+import type { MetadataFilterState } from './filters/types';
 import type { HttpSearchClient, SearchClient } from './ipc';
 import { getApiKey, isSecretStorageAvailable } from './secrets';
 import type { CustomPostfix } from './ui/queryParser';
@@ -37,6 +39,8 @@ export interface HybridSearchSettings {
   inlineSearchLimit: number;
   inlineSearchThreshold: number;
   inlineSearchShowPreview: boolean;
+  /** Visual metadata filters shared by the search modal and panel. */
+  metadataFilters: MetadataFilterState;
 }
 
 export const DEFAULT_SETTINGS: HybridSearchSettings = {
@@ -71,6 +75,7 @@ export const DEFAULT_SETTINGS: HybridSearchSettings = {
   inlineSearchLimit: 10,
   inlineSearchThreshold: 0,
   inlineSearchShowPreview: true,
+  metadataFilters: EMPTY_FILTER_STATE,
 };
 
 function normalizeCustomPostfixes(value: unknown): CustomPostfix[] {
@@ -143,6 +148,7 @@ export function normalizeSettings(settings: HybridSearchSettings): HybridSearchS
       typeof settings.inlineSearchShowPreview === 'boolean'
         ? settings.inlineSearchShowPreview
         : DEFAULT_SETTINGS.inlineSearchShowPreview,
+    metadataFilters: normalizeFilterState(settings.metadataFilters),
   };
 }
 

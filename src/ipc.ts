@@ -5,6 +5,7 @@ import type { RequestUrlParam } from 'obsidian';
 import { requestUrl } from 'obsidian';
 import * as os from 'os';
 import * as path from 'path';
+import type { EngineStructuredFilters } from './filters/types';
 
 export interface MatchAnchor {
   kind: 'bm25' | 'semantic';
@@ -39,7 +40,7 @@ export interface SearchResult {
   primaryAnchorIndex?: number;
 }
 
-interface SearchOptions {
+export interface SearchOptions {
   mode?: 'hybrid' | 'semantic' | 'fulltext' | 'title';
   related?: boolean;
   notePath?: string;
@@ -54,13 +55,64 @@ interface SearchOptions {
   depth?: number;
   direction?: 'outgoing' | 'backlinks' | 'both';
   linkType?: 'wiki' | 'markdown' | 'all';
+  /** Structured metadata filters. Send only after checking engine capabilities. */
+  filters?: EngineStructuredFilters;
+  /** Page offset; metadata-only searches only. */
+  offset?: number;
+}
+
+/** Page information from engines with the `searchMeta` capability. `total` is an
+ *  exact note count only when `totalExact` is true (metadata-only searches). */
+export interface SearchMeta {
+  apiVersion?: number;
+  kind?: 'ranked' | 'metadata' | 'related' | 'similar';
+  returned?: number;
+  offset?: number;
+  limit?: number | null;
+  total?: number | null;
+  totalExact?: boolean;
+  hasMore?: boolean | null;
+  nextOffset?: number | null;
+}
+
+export interface SearchResponse {
+  results: SearchResult[];
+  meta?: SearchMeta;
+}
+
+/** What the connected engine supports. Engines before API version 2 report nothing. */
+export interface EngineCapabilities {
+  apiVersion: number;
+  capabilities: string[];
+  propertyIndexError?: string;
+}
+
+const LEGACY_ENGINE_CAPABILITIES: EngineCapabilities = { apiVersion: 1, capabilities: [] };
+
+/** Reads the capability report of `status` / `capabilities` responses defensively. */
+export function parseEngineCapabilities(raw: unknown): EngineCapabilities {
+  if (typeof raw !== 'object' || raw === null) return LEGACY_ENGINE_CAPABILITIES;
+  const value = raw as Record<string, unknown>;
+  const apiVersion = typeof value.apiVersion === 'number' ? value.apiVersion : 1;
+  const capabilities = Array.isArray(value.capabilities)
+    ? value.capabilities.filter((c): c is string => typeof c === 'string')
+    : [];
+  return {
+    apiVersion,
+    capabilities,
+    ...(typeof value.propertyIndexError === 'string' && {
+      propertyIndexError: value.propertyIndexError,
+    }),
+  };
 }
 
 interface StdioResponse {
   ready?: boolean;
   id?: string;
   results?: SearchResult[];
+  meta?: SearchMeta;
   status?: Record<string, unknown>;
+  capabilities?: unknown;
   error?: string;
 }
 
@@ -399,6 +451,59 @@ export class SearchClient {
     });
   }
 
+  /** Like search(), but keeps the page metadata and REJECTS on engine errors instead
+   *  of resolving an empty list — a failed filtered search must never look like
+   *  "no matches". */
+  searchWithMeta(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
+    return new Promise((resolve, reject) => {
+      const id = String(++this.counter);
+      this.pending.set(id, (msg) => {
+        if (msg.error) reject(new Error(msg.error));
+        else resolve({ results: msg.results ?? [], meta: msg.meta });
+      });
+      this.waitReady().then(
+        () => {
+          this.proc.stdin!.write(JSON.stringify({ id, query, options }) + '\n');
+        },
+        (err: unknown) => {
+          this.pending.delete(id);
+          reject(err instanceof Error ? err : new Error(String(err)));
+        },
+      );
+    });
+  }
+
+  /** Engine API version and features. Engines without the `capabilities` action
+   *  answer "unknown action" and are reported as legacy (API version 1). */
+  getCapabilities(timeoutMs = 15_000): Promise<EngineCapabilities> {
+    return new Promise((resolve, reject) => {
+      const id = String(++this.counter);
+      const timer = window.setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error('Capability request timed out.'));
+      }, timeoutMs);
+      this.pending.set(id, (msg) => {
+        window.clearTimeout(timer);
+        if (msg.error) {
+          if (/unknown action|stdio request/i.test(msg.error)) resolve(LEGACY_ENGINE_CAPABILITIES);
+          else reject(new Error(msg.error));
+          return;
+        }
+        resolve(parseEngineCapabilities(msg.capabilities));
+      });
+      this.waitReady(timeoutMs).then(
+        () => {
+          this.proc.stdin!.write(JSON.stringify({ id, action: 'capabilities' }) + '\n');
+        },
+        (err: unknown) => {
+          window.clearTimeout(timer);
+          this.pending.delete(id);
+          reject(err instanceof Error ? err : new Error(String(err)));
+        },
+      );
+    });
+  }
+
   /** Index and provider report from the already-running server.
    *  Uses the live connection rather than a second process, so it costs one
    *  round-trip and never touches the database on its own. */
@@ -519,6 +624,44 @@ export class HttpSearchClient {
     }
   }
 
+  /** Like search(), but keeps page metadata and rejects on tool errors. */
+  async searchWithMeta(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
+    await this.maybeRestorePrimary();
+    const attemptedEndpoint = this.active;
+    try {
+      const response = await this.searchEndpointDetailed(attemptedEndpoint, query, options);
+      this.markEndpointHealthy(attemptedEndpoint);
+      return response;
+    } catch (err) {
+      const fallback =
+        err instanceof McpToolError ? null : this.getFailoverEndpoint(attemptedEndpoint, err);
+      if (fallback) {
+        try {
+          const response = await this.searchEndpointDetailed(fallback, query, options);
+          this.markEndpointHealthy(fallback);
+          this.nextPrimaryProbeAt = Date.now() + PRIMARY_RETRY_WHILE_ON_FALLBACK_MS;
+          this.activateEndpoint(fallback, err);
+          return response;
+        } catch (fallbackErr) {
+          if (!(fallbackErr instanceof McpToolError)) {
+            this.emitFallbackFailed(fallback, fallbackErr);
+            this.restorePrimaryAfterFailedFailover();
+          }
+          throw fallbackErr;
+        }
+      }
+      throw err;
+    }
+  }
+
+  /** Capabilities from the `status` tool. Servers that do not report them are legacy. */
+  async getCapabilities(timeoutMs = 15_000): Promise<EngineCapabilities> {
+    const status = await this.statusReport(timeoutMs);
+    return status.capabilities === undefined
+      ? LEGACY_ENGINE_CAPABILITIES
+      : parseEngineCapabilities(status.capabilities);
+  }
+
   dispose(): void {
     this.disposed = true;
     this.onStatusChange = undefined;
@@ -586,6 +729,49 @@ export class HttpSearchClient {
       ) {
         this.resetHttpSession(endpoint, { invalidateGeneration: true });
         return this.searchOnce(endpoint, query, options, timeoutMs);
+      }
+      throw err;
+    }
+  }
+
+  private async searchEndpointDetailed(
+    endpoint: HttpEndpointState,
+    query: string,
+    options: SearchOptions,
+  ): Promise<SearchResponse> {
+    const timeoutMs = this.timeoutForEndpoint(endpoint);
+    const once = async (): Promise<SearchResponse> => {
+      await this.waitReadyForEndpoint(endpoint, timeoutMs);
+      const generation = endpoint.sessionGeneration;
+      const response = await this.postSearchMcpRequest(
+        endpoint,
+        query,
+        options,
+        generation,
+        timeoutMs,
+      );
+      if (response.error) throw new McpToolError(response.error.message ?? 'Search failed.');
+      const text = response.result?.content?.find((part) => part.type === 'text')?.text;
+      if (response.result?.isError === true) throw new McpToolError(text ?? 'Search failed.');
+      if (!text) throw new McpToolError('Search returned no content.');
+      let body: { results?: SearchResult[]; meta?: SearchMeta };
+      try {
+        body = JSON.parse(text) as { results?: SearchResult[]; meta?: SearchMeta };
+      } catch {
+        throw new McpToolError('Search returned an unreadable response.');
+      }
+      return { results: body.results ?? [], meta: body.meta };
+    };
+    try {
+      return await once();
+    } catch (err) {
+      if (
+        isLikelyStaleMcpSessionError(err) &&
+        err instanceof McpSearchRequestError &&
+        err.requestSessionGeneration === endpoint.sessionGeneration
+      ) {
+        this.resetHttpSession(endpoint, { invalidateGeneration: true });
+        return once();
       }
       throw err;
     }
@@ -819,6 +1005,8 @@ export class HttpSearchClient {
       ...(options.depth !== undefined && { depth: options.depth }),
       ...(options.direction !== undefined && { direction: options.direction }),
       ...(options.linkType !== undefined && { link_type: options.linkType }),
+      ...(options.filters !== undefined && { filters: options.filters }),
+      ...(options.offset !== undefined && { offset: options.offset }),
     };
   }
 
@@ -946,6 +1134,15 @@ function requestWithTimeout(request: RequestUrlParam, timeoutMs: number): Promis
 function isLikelyStaleMcpSessionError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   return /HTTP MCP request failed: (400|401|403|404|409)\b/.test(err.message);
+}
+
+/** The server answered, but the tool reported an error (e.g. invalid filters). Never
+ *  a reason to fail over: another server would reject the same request. */
+class McpToolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'McpToolError';
+  }
 }
 
 class McpSearchRequestError extends Error {

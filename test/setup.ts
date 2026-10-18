@@ -155,6 +155,15 @@ if (typeof HTMLElement !== 'undefined' && !('hide' in HTMLElement.prototype)) {
   };
 }
 
+if (typeof HTMLElement !== 'undefined' && !('toggle' in HTMLElement.prototype)) {
+  (HTMLElement.prototype as HTMLElement & { toggle: (show: boolean) => void }).toggle = function (
+    show: boolean,
+  ): void {
+    // eslint-disable-next-line obsidianmd/no-static-styles-assignment -- polyfill toggle() for jsdom test environment
+    this.style.display = show ? '' : 'none';
+  };
+}
+
 // Polyfill Obsidian's activeWindow / activeDocument globals for tests
 
 if (typeof globalThis !== 'undefined') {
