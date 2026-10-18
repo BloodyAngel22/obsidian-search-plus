@@ -1623,50 +1623,60 @@ li.hybrid-search-semantic-match {
 /* ── Metadata filters (shared by the search modal and panel) ─────────────── */
 
 .search-plus-filter-bar {
+  container-type: inline-size;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 6px var(--size-4-3, 12px);
+  gap: 2px;
+  padding: 4px var(--size-4-3, 12px);
   border-bottom: 1px solid var(--background-modifier-border);
   font-size: var(--font-ui-small);
 }
 
 .hybrid-search-panel .search-plus-filter-bar {
   flex: 0 0 auto;
-  padding: 6px 0;
+  padding: 4px 0;
 }
 
 .search-plus-filter-toolbar {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
+  gap: var(--size-4-1, 4px);
+  min-height: var(--input-height, 30px);
 }
 
 .search-plus-toolbar-spacer {
   flex: 1 1 auto;
 }
 
-.search-plus-mode-select,
-.search-plus-operator-select {
+.search-plus-mode-select {
   font-size: var(--font-ui-small);
-  height: auto;
-  padding-top: 2px;
-  padding-bottom: 2px;
+  max-width: 50%;
 }
 
-.search-plus-add-filter {
+/* "+ Filter" and "Clear": quiet text buttons that still have a full hit target. */
+.search-plus-add-filter,
+.search-plus-clear-filters {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  height: var(--input-height, 30px);
+  padding: 0 var(--size-4-2, 8px);
   font-size: var(--font-ui-small);
-  padding: 2px 8px;
-  height: auto;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.search-plus-add-filter:hover,
+.search-plus-clear-filters:hover {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
 }
 
 .search-plus-add-filter.is-active {
-  background-color: var(--interactive-accent);
-  color: var(--text-on-accent);
+  background-color: var(--background-modifier-hover);
+  color: var(--text-accent);
 }
 
 .search-plus-add-icon {
@@ -1674,151 +1684,159 @@ li.hybrid-search-semantic-match {
 }
 
 .search-plus-add-icon svg {
-  width: 14px;
-  height: 14px;
+  width: var(--icon-s, 16px);
+  height: var(--icon-s, 16px);
 }
 
 .search-plus-filter-rows {
   display: flex;
   flex-direction: column;
-  gap: 4px;
 }
 
+.search-plus-filter-rows:empty {
+  display: none;
+}
+
+/* One line per filter: state · property · condition · values · remove. */
 .search-plus-filter-row {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 4px 6px;
-  border: 1px solid var(--background-modifier-border);
-  border-left-width: 3px;
-  border-radius: var(--radius-s, 4px);
-  background-color: var(--background-primary);
-}
-
-/* Active: restricts results. Incomplete: added but not applied. */
-.search-plus-filter-row.is-active {
-  border-left-color: var(--interactive-accent);
-}
-
-.search-plus-filter-row.is-incomplete {
-  border-style: dashed;
-  border-left-style: solid;
-  border-left-color: var(--text-faint);
-  opacity: 0.85;
-}
-
-.search-plus-filter-row.is-invalid {
-  border-left-color: var(--text-error);
-}
-
-.search-plus-filter-row.has-no-match {
-  border-left-color: var(--text-warning, var(--color-orange));
-}
-
-.search-plus-filter-row-head {
-  display: flex;
+  display: grid;
+  grid-template-columns: 14px fit-content(40%) auto minmax(4em, 1fr) auto;
+  grid-template-areas:
+    'state field op value remove'
+    '. msg msg msg msg';
   align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
+  column-gap: var(--size-4-1, 4px);
+  min-height: 28px;
+  border-radius: var(--radius-s, 4px);
   min-width: 0;
 }
 
+/* Narrow side panel: the values move to a second line under the property. */
+@container (max-width: 340px) {
+  .search-plus-filter-row {
+    grid-template-columns: 14px minmax(0, 1fr) auto auto;
+    grid-template-areas:
+      'state field op remove'
+      '. value value value'
+      '. msg msg msg';
+    padding-bottom: 2px;
+  }
+}
+
+.search-plus-filter-row:hover,
+.search-plus-filter-row.is-editing {
+  background-color: var(--background-modifier-hover);
+}
+
+.search-plus-filter-state {
+  grid-area: state;
+  justify-self: center;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: var(--interactive-accent);
+}
+
+.search-plus-filter-row.is-incomplete .search-plus-filter-state {
+  background-color: transparent;
+  box-shadow: inset 0 0 0 1px var(--text-faint);
+}
+
+.search-plus-filter-row.has-no-match .search-plus-filter-state {
+  background-color: var(--text-warning, var(--color-orange));
+}
+
+.search-plus-filter-row.is-invalid .search-plus-filter-state {
+  background-color: var(--text-error);
+}
+
 .search-plus-filter-field {
-  font-weight: var(--font-semibold, 600);
+  grid-area: field;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 100%;
-  flex: 0 1 auto;
+  color: var(--text-normal);
+  font-weight: var(--font-medium, 500);
 }
 
-.search-plus-remove-filter {
-  margin-left: auto;
-  padding: 2px;
+/* The condition dropdown reads as text until hovered. */
+.search-plus-operator-select.dropdown {
+  grid-area: op;
+  height: 24px;
+  padding: 0 calc(var(--size-4-2, 8px) + 12px) 0 var(--size-4-1, 4px);
+  background-color: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  background-position: right 4px center;
 }
 
-.search-plus-filter-values {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px;
-}
-
-.search-plus-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  max-width: 100%;
-  padding: 0 2px 0 6px;
-  border-radius: var(--radius-s, 4px);
+.search-plus-operator-select.dropdown:hover,
+.search-plus-operator-select.dropdown:focus-visible {
   background-color: var(--background-modifier-hover);
   color: var(--text-normal);
 }
 
-.search-plus-chip-label {
+.search-plus-filter-value {
+  grid-area: value;
+  min-width: 0;
+  height: 24px;
+  padding: 0 var(--size-4-2, 8px);
+  justify-content: flex-start;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-/* Selected value no note has any more: kept, but visibly unmatched. */
-.search-plus-chip.is-missing .search-plus-chip-label {
-  color: var(--text-muted);
-  text-decoration: line-through dotted;
-}
-
-.search-plus-chip-remove {
-  background: none;
+  background-color: var(--background-modifier-form-field, var(--background-primary));
   box-shadow: none;
-  border: none;
-  padding: 0 4px;
-  height: auto;
-  color: var(--text-muted);
-  cursor: pointer;
-}
-
-.search-plus-chip-remove:hover {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s, 4px);
   color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  text-align: left;
+  display: block;
 }
 
-.search-plus-add-value,
-.search-plus-clear-values,
-.search-plus-clear-filters,
-.search-plus-footer-action,
-.search-plus-load-more {
-  font-size: var(--font-ui-smaller, 12px);
-  padding: 1px 8px;
-  height: auto;
+.search-plus-filter-value:hover {
+  border-color: var(--background-modifier-border-hover, var(--text-faint));
 }
 
-.search-plus-filter-row.is-incomplete .search-plus-add-value {
+.search-plus-filter-value[aria-expanded='true'] {
+  border-color: var(--interactive-accent);
+}
+
+.search-plus-filter-value.is-empty {
   color: var(--text-accent);
+  border-style: dashed;
 }
 
-.search-plus-type-badge {
-  font-size: 10px;
-  font-family: var(--font-monospace);
+.search-plus-filter-value.has-missing {
+  color: var(--text-warning, var(--color-orange));
+}
+
+.search-plus-remove-filter {
+  grid-area: remove;
+  padding: var(--size-2-2, 4px);
   color: var(--text-faint);
 }
 
+.search-plus-remove-filter:hover {
+  color: var(--text-normal);
+}
+
 .search-plus-filter-message {
+  grid-area: msg;
+  padding: 0 0 2px;
   font-size: var(--font-ui-smaller, 12px);
-  color: var(--text-muted);
-}
-
-.search-plus-filter-row.is-invalid .search-plus-filter-message {
   color: var(--text-error);
-}
-
-.search-plus-filter-row.has-no-match .search-plus-filter-message {
-  color: var(--text-warning, var(--color-orange));
 }
 
 .search-plus-filter-footer {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--size-4-2, 8px);
+  min-height: 20px;
 }
 
 .search-plus-filter-status {
@@ -1834,18 +1852,57 @@ li.hybrid-search-semantic-match {
   color: var(--text-warning, var(--color-orange));
 }
 
-/* Inline popover: expands in place so it never clips inside the modal or a narrow sidebar. */
-.search-plus-popover {
+.search-plus-footer-action,
+.search-plus-load-more {
+  font-size: var(--font-ui-smaller, 12px);
+  padding: 2px var(--size-4-2, 8px);
+  height: auto;
+}
+
+.search-plus-load-more {
+  display: block;
+  margin: 8px auto;
+}
+
+/* ── Floating popover (body level, see FloatingPopover.ts) ─────────────────── */
+
+.search-plus-floating-popover {
+  position: fixed;
+  left: var(--search-plus-popover-left, 8px);
+  top: var(--search-plus-popover-top, auto);
+  bottom: var(--search-plus-popover-bottom, auto);
+  width: var(--search-plus-popover-width, 280px);
+  max-height: var(--search-plus-popover-max-height, 320px);
+  z-index: var(--layer-menu, 65);
   display: flex;
   flex-direction: column;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-m, 6px);
-  background-color: var(--background-secondary);
-  box-shadow: var(--shadow-s);
   overflow: hidden;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m, 8px);
+  background-color: var(--background-primary);
+  box-shadow: var(--shadow-l, var(--shadow-s));
+  font-size: var(--font-ui-small);
+  color: var(--text-normal);
+}
+
+.search-plus-floating-popover .search-plus-popover {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* The search field sits on top; above the anchor it moves to the bottom, next to it. */
+.search-plus-floating-popover.is-above {
+  flex-direction: column-reverse;
+}
+
+.search-plus-floating-popover.is-above .search-plus-popover {
+  flex-direction: column-reverse;
 }
 
 .search-plus-popover-input {
+  flex: 0 0 auto;
   width: 100%;
   border: none;
   border-bottom: 1px solid var(--background-modifier-border);
@@ -1854,18 +1911,30 @@ li.hybrid-search-semantic-match {
   font-size: var(--font-ui-small);
 }
 
+.search-plus-floating-popover.is-above .search-plus-popover-input {
+  border-bottom: none;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.search-plus-popover-input:focus {
+  box-shadow: none;
+}
+
 .search-plus-popover-list {
-  max-height: 220px;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
-  padding: 2px 0;
+  padding: var(--size-2-2, 4px);
 }
 
 .search-plus-popover-item {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 3px 8px;
-  cursor: pointer;
+  min-height: 28px;
+  padding: 2px var(--size-4-2, 8px);
+  border-radius: var(--radius-s, 4px);
+  cursor: var(--cursor, pointer);
   min-width: 0;
 }
 
@@ -1896,6 +1965,12 @@ li.hybrid-search-semantic-match {
   color: var(--text-accent);
 }
 
+.search-plus-type-badge {
+  font-size: var(--font-ui-smaller, 12px);
+  font-family: var(--font-monospace);
+  color: var(--text-faint);
+}
+
 .search-plus-popover-empty,
 .search-plus-popover-more {
   padding: 4px 8px;
@@ -1903,7 +1978,124 @@ li.hybrid-search-semantic-match {
   font-size: var(--font-ui-smaller, 12px);
 }
 
-.search-plus-load-more {
-  display: block;
-  margin: 8px auto;
+/* Selected values of the open row, removable one by one. */
+.search-plus-popover-header {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px var(--size-4-2, 8px);
+  border-bottom: 1px solid var(--background-modifier-border);
+  background-color: var(--background-secondary);
+}
+
+.search-plus-floating-popover.is-above .search-plus-popover-header {
+  border-bottom: none;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.search-plus-popover-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller, 12px);
+}
+
+.search-plus-clear-values {
+  padding: 2px 6px;
+  font-size: var(--font-ui-smaller, 12px);
+  color: var(--text-muted);
+}
+
+.search-plus-filter-values {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-height: 5.5em;
+  overflow-y: auto;
+}
+
+.search-plus-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  max-width: 100%;
+  padding: 0 0 0 6px;
+  border-radius: var(--radius-s, 4px);
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.search-plus-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Selected value no note has any more: kept, but visibly unmatched. */
+.search-plus-chip.is-missing .search-plus-chip-label {
+  color: var(--text-muted);
+  text-decoration: line-through dotted;
+}
+
+.search-plus-chip-remove {
+  background: none;
+  box-shadow: none;
+  border: none;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 4px;
+  color: var(--text-muted);
+  cursor: var(--cursor, pointer);
+}
+
+.search-plus-chip-remove:hover {
+  color: var(--text-normal);
+}
+
+/* ── Result context and navigation ─────────────────────────────────────────── */
+
+.search-plus-result-context {
+  min-width: 0;
+  margin-top: 1px;
+}
+
+.search-plus-result-heading {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-accent);
+  font-size: var(--font-ui-smaller, 12px);
+}
+
+.search-plus-result-snippet {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller, 12px);
+  line-height: var(--line-height-tight, 1.3);
+}
+
+.search-plus-result-hit {
+  color: var(--text-normal);
+  background-color: var(--text-highlight-bg);
+  border-radius: 2px;
+}
+
+.hybrid-search-panel-heading {
+  padding: 0 6px 1px 28px;
+}
+
+/* Reading view: the passage a result opened at, for a moment. */
+.search-plus-nav-flash {
+  border-radius: var(--radius-s, 4px);
+  background-color: var(--text-highlight-bg);
+  box-shadow: 0 0 0 4px var(--text-highlight-bg);
+  transition:
+    background-color 400ms ease,
+    box-shadow 400ms ease;
 }

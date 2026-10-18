@@ -39,7 +39,7 @@ let listCounter = 0;
 export const handledListEvents = new WeakSet<KeyboardEvent>();
 
 /**
- * Inline searchable list: a text input plus a bounded result list, driven entirely by
+ * Searchable list: a text input plus a bounded result list, driven entirely by
  * the keyboard (ArrowUp/Down, Enter, Escape) or the mouse. Rendering is capped by the
  * loader, so properties with thousands of values never create thousands of elements.
  */
@@ -74,6 +74,7 @@ export class SearchableList {
     });
     this.inputEl.addEventListener('input', () => {
       this.active = 0;
+      this.listEl.scrollTop = 0;
       this.refresh();
     });
     this.inputEl.addEventListener('keydown', (evt) => this.onKeydown(evt));
@@ -98,8 +99,10 @@ export class SearchableList {
     return this.inputEl.value;
   }
 
+  /** Reload items for the current query, keeping the highlighted row and scroll position. */
   refresh(): void {
     const page = this.options.load(this.inputEl.value);
+    const scrollTop = this.listEl.scrollTop;
     this.items = page.items;
     if (this.active >= this.items.length) this.active = Math.max(0, this.items.length - 1);
     this.listEl.empty();
@@ -132,6 +135,7 @@ export class SearchableList {
         text: `${page.hiddenCount} more — type to narrow`,
       });
     }
+    this.listEl.scrollTop = scrollTop;
   }
 
   private setActive(index: number, scroll = true): void {

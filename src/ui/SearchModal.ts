@@ -20,6 +20,8 @@ import { describeResults } from './filters/resultStatus';
 import { GraphPanel } from './GraphPanel';
 import { hookInternalLinks } from './linkHandler';
 import { registerModalKeymap } from './modalKeymap';
+import { openResultAtAnchor, type OpenResultOptions } from './navigation/openResult';
+import { getResultContext, renderResultContext } from './navigation/resultContext';
 import {
   applySuperchargedLinkAttributes,
   createInternalLink,
@@ -383,8 +385,10 @@ export class SearchModal extends SuggestModal<SearchResult> {
       // source of truth the empty-query `~` mode uses.
       resolveSimilar: (target) =>
         resolveSimilarTarget(this.app, target, this.activePath, this.activePath ?? ''),
-      snippetLength: this.settings.showPreview && this.settings.scrollToSnippet ? 400 : 0,
-      anchors: this.settings.showPreview && this.settings.scrollToSnippet,
+      // Snippets feed the row context; anchors are needed to open results at the
+      // matching passage, so both are requested whatever the preview settings are.
+      snippetLength: 400,
+      anchors: true,
       pageSize: METADATA_PAGE_SIZE,
     });
 
@@ -568,6 +572,14 @@ export class SearchModal extends SuggestModal<SearchResult> {
       });
     }
 
+    if (!this.isRecentMode) {
+      renderResultContext(
+        container,
+        getResultContext(result),
+        this.currentMode === 'fulltext' ? this.currentQueryWords : null,
+      );
+    }
+
     if (this.settings.showMeta) {
       const folder = result.path.includes('/') ? result.path.replace(/\/[^/]+$/, '') : '';
       const metaRow = container.createDiv({ cls: 'hybrid-search-meta' });
@@ -601,8 +613,17 @@ export class SearchModal extends SuggestModal<SearchResult> {
   onChooseSuggestion(result: SearchResult, _evt: MouseEvent | KeyboardEvent): void {
     const abstract = this.app.vault.getAbstractFileByPath(result.path.normalize('NFC'));
     if (abstract instanceof TFile) {
-      void this.app.workspace.getLeaf(false).openFile(abstract);
+      // The leaf is picked now, before anything async, and navigation stays inside it.
+      const leaf = this.app.workspace.getLeaf(false);
+      void openResultAtAnchor(this.app, leaf, abstract, result, this.getNavigationOptions());
     }
+  }
+
+  /** Mode and query words of the current results, used to open them at their passage. */
+  getNavigationOptions(): OpenResultOptions {
+    return this.isRecentMode
+      ? {}
+      : { mode: this.currentMode, queryWords: [...this.currentQueryWords] };
   }
 
   // @ts-ignore — internal SuggestModal API not in type declarations; fires on arrow-key navigation

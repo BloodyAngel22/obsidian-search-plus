@@ -528,6 +528,33 @@ export class SecretStorage {
   }
 }
 
+/** Same contract as Obsidian's getFrontMatterInfo: a `---` line opens the block and
+ *  the next `---` line closes it; `contentStart` is the offset after the closing line. */
+export function getFrontMatterInfo(content: string): {
+  exists: boolean;
+  frontmatter: string;
+  from: number;
+  to: number;
+  contentStart: number;
+} {
+  const none = { exists: false, frontmatter: '', from: 0, to: 0, contentStart: 0 };
+  const open = /^---[ \t]*\r?\n/.exec(content);
+  if (!open) return none;
+  const from = open[0].length;
+  const close = /^---[ \t]*(\r?\n|$)/gm;
+  close.lastIndex = from;
+  const match = close.exec(content);
+  if (!match) return none;
+  const to = match.index;
+  return {
+    exists: true,
+    frontmatter: content.slice(from, to),
+    from,
+    to,
+    contentStart: match.index + match[0].length,
+  };
+}
+
 export class Notice {
   constructor(_message: string, _timeout?: number) {}
 }

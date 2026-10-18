@@ -88,12 +88,21 @@ if (typeof HTMLElement !== 'undefined' && !('createDiv' in HTMLElement.prototype
 if (typeof HTMLElement !== 'undefined' && !('createSpan' in HTMLElement.prototype)) {
   (
     HTMLElement.prototype as HTMLElement & {
-      createSpan: (opts?: { text?: string; cls?: string }) => HTMLSpanElement;
+      createSpan: (opts?: {
+        text?: string;
+        cls?: string;
+        attr?: Record<string, string>;
+      }) => HTMLSpanElement;
     }
-  ).createSpan = function (opts?: { text?: string; cls?: string }): HTMLSpanElement {
+  ).createSpan = function (opts?: {
+    text?: string;
+    cls?: string;
+    attr?: Record<string, string>;
+  }): HTMLSpanElement {
     const span = activeDocument.createSpan();
     if (opts?.text) span.textContent = opts.text;
     if (opts?.cls) span.className = opts.cls;
+    for (const [key, value] of Object.entries(opts?.attr ?? {})) span.setAttribute(key, value);
     this.appendChild(span);
     return span;
   };
@@ -251,4 +260,12 @@ if (typeof Document !== 'undefined') {
       return span;
     };
   }
+}
+
+if (typeof Node !== 'undefined' && !('appendText' in Node.prototype)) {
+  (Node.prototype as Node & { appendText: (text: string) => void }).appendText = function (
+    text: string,
+  ) {
+    this.appendChild(activeDocument.createTextNode(text));
+  };
 }

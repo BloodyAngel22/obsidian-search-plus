@@ -379,6 +379,99 @@ describe('SearchModal', () => {
     expect(mockGetLeaf).toHaveBeenCalledWith(false);
     expect(mockOpenFile).toHaveBeenCalledWith(expect.objectContaining({ path: sampleResult.path }));
   });
+
+  const anchoredResult: SearchResult = {
+    ...sampleResult,
+    snippet: '## Method > ### Cards\nEach card holds **one** idea and links to others.',
+    previewAnchors: [
+      {
+        kind: 'bm25',
+        headingPath: '## Method > ### Cards',
+        matchText: 'Each card holds one idea and links to others.',
+        charStart: null,
+        charEnd: null,
+      },
+    ],
+    primaryAnchorIndex: 0,
+  };
+
+  it('onChooseSuggestion opens an anchored result at its passage in the chosen leaf', async () => {
+    mockCachedRead.mockResolvedValue(
+      '---\ntags: [pkm]\n---\n## Method\n\n### Cards\n\nEach card holds **one** idea and links to others.\n',
+    );
+    modal.onChooseSuggestion(anchoredResult, new MouseEvent('click'));
+    expect(mockGetLeaf).toHaveBeenCalledWith(false);
+    await vi.waitFor(() =>
+      expect(mockOpenFile).toHaveBeenCalledWith(
+        expect.objectContaining({ path: sampleResult.path }),
+        { eState: { line: 7 } },
+      ),
+    );
+  });
+
+  it('always asks the engine for anchors and snippets, whatever the preview settings', async () => {
+    vi.useFakeTimers();
+    const noPreview = new SearchModal(
+      mockApp as never,
+      mockClient,
+      { ...DEFAULT_SETTINGS, showPreview: false, scrollToSnippet: false },
+      vi.fn(),
+    );
+    const promise = noPreview.getSuggestions('zettel');
+    vi.runAllTimers();
+    await promise;
+    expect(mockSearch).toHaveBeenCalledWith(
+      'zettel',
+      expect.objectContaining({ anchors: true, snippetLength: 400 }),
+    );
+    vi.useRealTimers();
+  });
+
+  it('renderSuggestion shows the heading path and a short snippet', async () => {
+    vi.useFakeTimers();
+    const promise = modal.getSuggestions('semantic: idea');
+    vi.runAllTimers();
+    await promise;
+    vi.useRealTimers();
+    const el = activeDocument.createDiv();
+    modal.renderSuggestion(anchoredResult, el);
+    expect(el.querySelector('.search-plus-result-heading')?.textContent).toBe('Method → Cards');
+    expect(el.querySelector('.search-plus-result-snippet')?.textContent).toBe(
+      'Each card holds one idea and links to others.',
+    );
+    // Semantic matches never mark literal words.
+    expect(el.querySelector('.search-plus-result-hit')).toBeNull();
+  });
+
+  it('renderSuggestion marks exact query words for full-text results', async () => {
+    vi.useFakeTimers();
+    const promise = modal.getSuggestions('fulltext: idea');
+    vi.runAllTimers();
+    await promise;
+    vi.useRealTimers();
+    const el = activeDocument.createDiv();
+    modal.renderSuggestion(anchoredResult, el);
+    expect(
+      Array.from(el.querySelectorAll('.search-plus-result-hit')).map((e) => e.textContent),
+    ).toEqual(['idea']);
+  });
+
+  it('renders no context for results without anchors or snippets (metadata-only)', () => {
+    const el = activeDocument.createDiv();
+    modal.renderSuggestion({ ...sampleResult, snippet: undefined }, el);
+    expect(el.querySelector('.search-plus-result-context')).toBeNull();
+  });
+
+  it('previewing results never opens a note or touches the editor', () => {
+    const el = activeDocument.createDiv();
+    modal.renderSuggestion(anchoredResult, el);
+    el.dispatchEvent(new MouseEvent('mouseenter'));
+    (modal as unknown as { onSelectedChange(r: SearchResult): void }).onSelectedChange(
+      anchoredResult,
+    );
+    expect(mockGetLeaf).not.toHaveBeenCalled();
+    expect(mockOpenFile).not.toHaveBeenCalled();
+  });
 });
 
 type ModalInternals = {

@@ -2,6 +2,7 @@ import { Scope, setIcon, type App } from 'obsidian';
 import {
   formatScalar,
   operatorNeedsValues,
+  scalarKey,
   scalarTypeLabel,
   validateRow,
 } from '../../filters/filterState';
@@ -9,6 +10,7 @@ import type { FilterStore } from '../../filters/filterStore';
 import type { MetadataCatalog } from '../../filters/metadataCatalog';
 import type { MetadataMenuAdapter, MetadataMenuHint } from '../../filters/metadataMenu';
 import { FILTER_ROW_OPERATORS, type FilterRow, type FilterRowOperator } from '../../filters/types';
+import { FloatingPopover } from './FloatingPopover';
 import { handledListEvents, SearchableList } from './SearchableList';
 import { buildPropertyPage, buildValuePage, type ValuePage } from './valueItems';
 
@@ -21,6 +23,9 @@ const MODE_LABELS: Record<SearchMode, string> = {
   title: 'Title',
 };
 
+/** Up to this many values are named in the row; more are shown as a count. */
+const NAMED_VALUES = 2;
+
 export type FilterStatusTone = 'normal' | 'muted' | 'warning' | 'error';
 
 export interface FilterBarOptions {
@@ -32,37 +37,54 @@ export interface FilterBarOptions {
   mode?: { get: () => SearchMode; set: (mode: SearchMode) => void };
   /**
    * Keyboard isolation for hosts with their own key scope (the search modal): while
-   * focus is inside the bar a child scope is pushed, so arrows and Enter never move or
-   * open search results, and Escape closes an open list before the modal.
+   * focus is inside the bar or its popover a child scope is pushed, so arrows and Enter
+   * never move or open search results, and Escape closes an open popover before the modal.
    */
   keyScope?: { parent: Scope | undefined; onEscape: () => void };
   /** Return focus to the host's search input. */
   focusSearch?: () => void;
 }
 
-type OpenPopover = { kind: 'picker' } | { kind: 'values'; rowId: string };
+/** DOM of one filter row, built once and updated in place. */
+interface RowView {
+  el: HTMLDivElement;
+  stateEl: HTMLSpanElement;
+  fieldEl: HTMLSpanElement;
+  operatorSelect: HTMLSelectElement;
+  valueButton: HTMLButtonElement;
+  messageEl: HTMLDivElement;
+  /** What the row was last rendered from; unchanged rows are not touched. */
+  signature: string;
+}
+
+type OpenPopover =
+  | { kind: 'picker'; popover: FloatingPopover; list: SearchableList }
+  | {
+      kind: 'values';
+      rowId: string;
+      popover: FloatingPopover;
+      list: SearchableList;
+      headerEl: HTMLDivElement;
+    };
 
 /**
- * Compact metadata filter UI shared by SearchModal and SearchPanelView. All state
- * lives in the FilterStore; this component only renders it and turns user actions
- * into store updates, so both views behave identically.
+ * Compact metadata filter UI shared by SearchModal and SearchPanelView: a toolbar
+ * (mode, "+ Filter"), one single-line row per filter and a floating popover for picking
+ * properties and values. All state lives in the FilterStore; this component renders it
+ * and turns user actions into store updates, so both views behave identically.
  */
 export class FilterBar {
   readonly el: HTMLDivElement;
   private modeSelect?: HTMLSelectElement;
   private addButton: HTMLButtonElement;
-  private popoverHost: HTMLDivElement;
+  private clearButton: HTMLButtonElement;
   private rowsEl: HTMLDivElement;
   private footerEl: HTMLDivElement;
   private statusEl: HTMLSpanElement;
-  private clearButton: HTMLButtonElement;
   private actionButton: HTMLButtonElement;
   private actionHandler: (() => void) | null = null;
-  private rendering = false;
+  private rowViews = new Map<string, RowView>();
   private open: OpenPopover | null = null;
-  private list: SearchableList | null = null;
-  /** Which popover `list` belongs to, so state is only restored into the same one. */
-  private listOwner: string | null = null;
   private valuePage: ValuePage | null = null;
   private hints = new Map<string, MetadataMenuHint>();
   private scope: Scope | null = null;
@@ -89,6 +111,16 @@ export class FilterBar {
       });
     }
     toolbar.createDiv({ cls: 'search-plus-toolbar-spacer' });
+    this.clearButton = toolbar.createEl('button', {
+      cls: 'search-plus-clear-filters clickable-icon',
+      text: 'Clear',
+      attr: { type: 'button', 'aria-label': 'Clear all filters' },
+    });
+    this.clearButton.addEventListener('click', () => {
+      this.closePopover();
+      options.store.clearAll();
+      options.focusSearch?.();
+    });
     this.addButton = toolbar.createEl('button', {
       cls: 'search-plus-add-filter',
       attr: { type: 'button', 'aria-label': 'Add filter', 'aria-haspopup': 'listbox' },
@@ -97,19 +129,8 @@ export class FilterBar {
     this.addButton.createSpan({ text: 'Filter' });
     this.addButton.addEventListener('click', () => this.togglePicker());
 
-    this.popoverHost = this.el.createDiv({ cls: 'search-plus-popover-host' });
     this.rowsEl = this.el.createDiv({ cls: 'search-plus-filter-rows' });
     this.footerEl = this.el.createDiv({ cls: 'search-plus-filter-footer' });
-    this.clearButton = this.footerEl.createEl('button', {
-      cls: 'search-plus-clear-filters mod-muted',
-      text: 'Clear filters',
-      attr: { type: 'button' },
-    });
-    this.clearButton.addEventListener('click', () => {
-      this.closePopover();
-      options.store.clearAll();
-      options.focusSearch?.();
-    });
     this.statusEl = this.footerEl.createSpan({
       cls: 'search-plus-filter-status',
       attr: { 'aria-live': 'polite' },
@@ -125,18 +146,13 @@ export class FilterBar {
     // listens on an ancestor and must not see them.
     this.el.addEventListener('keydown', (evt) => evt.stopPropagation());
     // A popover never stays open without focus, so Escape in the search input keeps
-    // its usual meaning. Re-renders move focus internally and are ignored.
-    this.el.addEventListener('focusout', (evt) => {
-      if (this.rendering) return;
-      const next = evt.relatedTarget as Node | null;
-      if (next && this.el.contains(next)) return;
-      if (this.open) this.closePopover();
-    });
+    // its usual meaning.
+    this.el.addEventListener('focusout', (evt) => this.onFocusOut(evt));
     if (options.keyScope) this.setupKeyScope(options.keyScope);
 
-    this.disposers.push(options.store.subscribe(() => this.render()));
-    this.disposers.push(options.catalog.onChange(() => this.render()));
-    this.render();
+    this.disposers.push(options.store.subscribe(() => this.update()));
+    this.disposers.push(options.catalog.onChange(() => this.update(true)));
+    this.update();
   }
 
   setMode(mode: SearchMode): void {
@@ -161,108 +177,43 @@ export class FilterBar {
     return this.open !== null;
   }
 
-  /** Closes an open picker or value list; returns false when nothing was open. */
-  closePopover(): boolean {
-    if (!this.open) return false;
+  /**
+   * Closes an open picker or value list; returns false when nothing was open. With
+   * `restoreFocus` the control that opened the popover gets focus back.
+   */
+  closePopover(restoreFocus = false): boolean {
+    const open = this.open;
+    if (!open) return false;
     this.open = null;
-    this.list = null;
     this.valuePage = null;
-    this.render();
+    const trigger = this.triggerOf(open);
+    const hadFocus = this.isInside(open.popover.el.ownerDocument.activeElement);
+    open.popover.destroy();
+    this.addButton.removeClass('is-active');
+    this.addButton.setAttribute('aria-expanded', 'false');
+    for (const view of this.rowViews.values()) {
+      view.valueButton.setAttribute('aria-expanded', 'false');
+      view.el.removeClass('is-editing');
+    }
+    if (restoreFocus && trigger?.isConnected) trigger.focus();
+    else if (hadFocus && !this.isInside(this.el.ownerDocument.activeElement)) this.popScope();
     return true;
   }
 
   openPicker(): void {
-    this.open = { kind: 'picker' };
-    this.render();
-    this.list?.focus();
-  }
-
-  destroy(): void {
-    for (const dispose of this.disposers.splice(0)) dispose();
-    this.popScope();
-    this.el.remove();
-  }
-
-  private togglePicker(): void {
-    if (this.open?.kind === 'picker') {
-      this.closePopover();
-      this.options.focusSearch?.();
-    } else {
-      this.openPicker();
-    }
-  }
-
-  private openValues(rowId: string): void {
-    this.open = { kind: 'values', rowId };
-    this.render();
-    this.list?.focus();
-  }
-
-  private render(): void {
-    this.rendering = true;
-    try {
-      this.renderContent();
-    } finally {
-      this.rendering = false;
-    }
-    // The focused control may have been removed; never keep keys captured then.
-    const active = this.el.ownerDocument.activeElement;
-    if (this.scopePushed && !(active && this.el.contains(active))) this.popScope();
-  }
-
-  private renderContent(): void {
-    const rows = this.options.store.getRows();
-    // A re-render replaces the list; keep its query, highlight and focus.
-    const hadFocus =
-      this.list !== null && this.el.ownerDocument.activeElement === this.list.inputEl;
-    const sameOwner = this.listOwner !== null && this.listOwner === this.ownerKey(this.open);
-    const previousQuery = sameOwner ? (this.list?.getQuery() ?? '') : '';
-    const previousActive = sameOwner ? (this.list?.getActiveIndex() ?? 0) : 0;
-    if (
-      this.open?.kind === 'values' &&
-      !rows.some((row) => row.id === (this.open as { rowId: string }).rowId)
-    ) {
-      this.open = null;
-    }
-
-    this.addButton.toggleClass('is-active', this.open?.kind === 'picker');
-    this.addButton.setAttribute('aria-expanded', this.open?.kind === 'picker' ? 'true' : 'false');
-    this.popoverHost.empty();
-    this.list = null;
-    this.listOwner = this.ownerKey(this.open);
-    if (this.open?.kind === 'picker') {
-      this.renderPicker(previousQuery, previousActive);
-    }
-
-    this.rowsEl.empty();
-    for (const row of rows) this.renderRow(row, previousQuery, previousActive);
-    this.el.toggleClass('has-filters', rows.length > 0);
-    this.updateFooterVisibility();
-    // renderPicker / renderRow may have created a new list.
-    if (hadFocus) (this.list as SearchableList | null)?.focus();
-  }
-
-  private ownerKey(open: OpenPopover | null): string | null {
-    if (!open) return null;
-    return open.kind === 'picker' ? 'picker' : `values:${open.rowId}`;
-  }
-
-  private updateFooterVisibility(): void {
-    const hasRows = this.options.store.getRows().length > 0;
-    this.clearButton.toggle(hasRows);
-    this.footerEl.toggle(hasRows || !!this.statusEl.textContent || !!this.actionHandler);
-  }
-
-  private renderPicker(query: string, active: number): void {
+    this.closePopover();
     const activeFields = new Set(this.options.store.getRows().map((row) => row.field));
+    const popover = this.createPopover(this.addButton, 'search-plus-picker-popover');
     const { state } = this.options.catalog.getState();
-    this.list = new SearchableList(this.popoverHost, {
+    const list = new SearchableList(popover.el, {
       placeholder: 'Find a property...',
       emptyText: state === 'scanning' ? 'Reading properties...' : 'No properties found.',
       ariaLabel: 'Find a property',
-      initialQuery: query,
-      initialActive: active,
-      load: (q) => buildPropertyPage(this.options.catalog, q, activeFields),
+      load: (q) => {
+        activeFields.clear();
+        for (const row of this.options.store.getRows()) activeFields.add(row.field);
+        return buildPropertyPage(this.options.catalog, q, activeFields);
+      },
       onChoose: (item) => {
         const field = item.id.slice(2);
         const row = this.options.store.addRow(field);
@@ -271,74 +222,283 @@ export class FilterBar {
           return;
         }
         if (operatorNeedsValues(row.operator)) this.openValues(row.id);
-        else this.closePopover();
+        else this.closePopover(true);
       },
-      onClose: () => {
-        this.closePopover();
-        this.options.focusSearch?.();
-      },
+      onClose: () => this.closePopover(true),
     });
+    this.open = { kind: 'picker', popover, list };
+    this.addButton.addClass('is-active');
+    this.addButton.setAttribute('aria-expanded', 'true');
+    list.focus();
   }
 
-  private renderRow(row: FilterRow, query: string, active: number): void {
-    const validation = validateRow(row);
-    const noMatch = this.noMatchReason(row);
-    const rowEl = this.rowsEl.createDiv({
-      cls: `search-plus-filter-row is-${validation.status}${noMatch ? ' has-no-match' : ''}`,
-      attr: { 'data-row-id': row.id, 'data-field': row.field },
-    });
-    const head = rowEl.createDiv({ cls: 'search-plus-filter-row-head' });
-    const property = this.options.catalog.getProperty(row.field);
-    head.createSpan({
-      cls: 'search-plus-filter-field',
-      text: row.field,
-      attr: {
-        title: property?.caseVariants.length
-          ? `${row.field} (also used as ${property.caseVariants.join(', ')})`
-          : row.field,
-      },
-    });
+  destroy(): void {
+    for (const dispose of this.disposers.splice(0)) dispose();
+    this.closePopover();
+    this.popScope();
+    this.el.remove();
+  }
 
-    const operatorSelect = head.createEl('select', {
-      cls: 'dropdown search-plus-operator-select',
-      attr: { 'aria-label': `Condition for ${row.field}` },
+  private togglePicker(): void {
+    if (this.open?.kind === 'picker') this.closePopover(true);
+    else this.openPicker();
+  }
+
+  private openValues(rowId: string): void {
+    const view = this.rowViews.get(rowId);
+    const row = this.options.store.getRows().find((r) => r.id === rowId);
+    if (!view || !row) return;
+    this.closePopover();
+    const popover = this.createPopover(view.valueButton, 'search-plus-row-popover');
+    const headerEl = popover.el.createDiv({ cls: 'search-plus-popover-header' });
+    // Clicking header text must not take focus away from the search input.
+    headerEl.addEventListener('mousedown', (evt) => {
+      if (!(evt.target as HTMLElement).closest('button')) evt.preventDefault();
     });
+    this.getHint(row.field);
+    const list = new SearchableList(popover.el, {
+      placeholder: `Find ${row.field} values...`,
+      emptyText: 'No values yet. Type a value to use it.',
+      ariaLabel: `Values of ${row.field}`,
+      keepOpenOnChoose: true,
+      load: (q) => {
+        const current = this.findRow(rowId) ?? row;
+        const hint = this.hints.get(row.field) ?? null;
+        this.valuePage = buildValuePage(this.options.catalog, current, q, hint);
+        return this.valuePage;
+      },
+      onChoose: (item) => {
+        const value = this.valuePage?.valueById.get(item.id);
+        if (value === undefined) return;
+        this.options.store.toggleValue(rowId, value);
+      },
+      onClose: () => this.closePopover(true),
+    });
+    this.open = { kind: 'values', rowId, popover, list, headerEl };
+    this.renderValueHeader();
+    view.valueButton.setAttribute('aria-expanded', 'true');
+    view.el.addClass('is-editing');
+    list.focus();
+  }
+
+  private createPopover(anchor: HTMLElement, cls: string): FloatingPopover {
+    const popover = new FloatingPopover(anchor, {
+      cls,
+      isInside: (node) => this.el.contains(node),
+      // A click elsewhere closes the popover without stealing focus from what was clicked.
+      onOutside: () => this.closePopover(),
+    });
+    popover.el.addEventListener('keydown', (evt) => {
+      evt.stopPropagation();
+      // The popover sits at the end of the document; Tab would leave focus nowhere.
+      if (evt.key === 'Tab') {
+        evt.preventDefault();
+        this.closePopover(true);
+      }
+    });
+    popover.el.addEventListener('focusout', (evt) => this.onFocusOut(evt));
+    if (this.scope) popover.el.addEventListener('focusin', () => this.pushScope());
+    return popover;
+  }
+
+  private triggerOf(open: OpenPopover): HTMLElement | null {
+    if (open.kind === 'picker') return this.addButton;
+    return this.rowViews.get(open.rowId)?.valueButton ?? this.addButton;
+  }
+
+  private isInside(node: Node | null | undefined): boolean {
+    if (!node) return false;
+    return this.el.contains(node) || !!this.open?.popover.el.contains(node);
+  }
+
+  private onFocusOut(evt: FocusEvent): void {
+    const next = evt.relatedTarget as Node | null;
+    if (next && this.isInside(next)) return;
+    // Focus left the bar: stop capturing keys. A popover is closed by the click-outside
+    // check, or here when focus moved to another control.
+    this.popScope();
+    if (next && this.open) this.closePopover();
+  }
+
+  private findRow(rowId: string): FilterRow | undefined {
+    return this.options.store.getRows().find((r) => r.id === rowId);
+  }
+
+  /** Bring rows and the open popover in line with the store, touching only what changed. */
+  private update(force = false): void {
+    const rows = this.options.store.getRows();
+    const seen = new Set<string>();
+    let previous: HTMLElement | null = null;
+    for (const row of rows) {
+      seen.add(row.id);
+      let view = this.rowViews.get(row.id);
+      if (!view) {
+        view = this.createRowView(row.id);
+        this.rowViews.set(row.id, view);
+      }
+      this.updateRowView(view, row, force);
+      const expectedNext: Element | null = previous
+        ? previous.nextElementSibling
+        : this.rowsEl.firstElementChild;
+      if (expectedNext !== view.el) {
+        if (previous) previous.after(view.el);
+        else this.rowsEl.prepend(view.el);
+      }
+      previous = view.el;
+    }
+    for (const [id, view] of this.rowViews) {
+      if (seen.has(id)) continue;
+      view.el.remove();
+      this.rowViews.delete(id);
+    }
+    this.el.toggleClass('has-filters', rows.length > 0);
+    this.clearButton.toggle(rows.length > 0);
+    this.updateFooterVisibility();
+
+    const open = this.open;
+    if (open?.kind === 'values') {
+      const row = this.findRow(open.rowId);
+      if (!row || !operatorNeedsValues(row.operator)) {
+        // The row went away or no longer takes values; whoever changed it keeps focus.
+        this.closePopover();
+        return;
+      }
+      this.renderValueHeader();
+      open.list.refresh();
+      open.popover.position();
+    } else if (open?.kind === 'picker') {
+      open.list.refresh();
+    }
+  }
+
+  private createRowView(rowId: string): RowView {
+    const el = this.rowsEl.createDiv({
+      cls: 'search-plus-filter-row',
+      attr: { 'data-row-id': rowId },
+    });
+    const stateEl = el.createSpan({
+      cls: 'search-plus-filter-state',
+      attr: { 'aria-hidden': 'true' },
+    });
+    const fieldEl = el.createSpan({ cls: 'search-plus-filter-field' });
+    const operatorSelect = el.createEl('select', { cls: 'dropdown search-plus-operator-select' });
     for (const { value, label } of FILTER_ROW_OPERATORS) {
       operatorSelect.createEl('option', { text: label, attr: { value } });
     }
-    operatorSelect.value = row.operator;
     operatorSelect.addEventListener('change', () => {
-      this.options.store.setOperator(row.id, operatorSelect.value as FilterRowOperator);
+      this.options.store.setOperator(rowId, operatorSelect.value as FilterRowOperator);
     });
-
-    const removeButton = head.createEl('button', {
+    const valueButton = el.createEl('button', {
+      cls: 'search-plus-filter-value search-plus-add-value',
+      attr: { type: 'button', 'aria-haspopup': 'listbox', 'aria-expanded': 'false' },
+    });
+    valueButton.addEventListener('click', () => {
+      if (this.open?.kind === 'values' && this.open.rowId === rowId) this.closePopover(true);
+      else this.openValues(rowId);
+    });
+    const removeButton = el.createEl('button', {
       cls: 'clickable-icon search-plus-remove-filter',
-      attr: { type: 'button', 'aria-label': `Remove ${row.field} filter` },
+      attr: { type: 'button' },
     });
     setIcon(removeButton, 'x');
     removeButton.addEventListener('click', () => {
-      this.options.store.removeRow(row.id);
+      this.options.store.removeRow(rowId);
       this.options.focusSearch?.();
     });
-
-    if (operatorNeedsValues(row.operator)) this.renderValues(rowEl, row);
-
-    const message = validation.status !== 'active' ? validation.message : noMatch;
-    if (message) rowEl.createDiv({ cls: 'search-plus-filter-message', text: message });
-
-    if (this.open?.kind === 'values' && this.open.rowId === row.id) {
-      const host = rowEl.createDiv({ cls: 'search-plus-row-popover' });
-      this.renderValueList(host, row, query, active);
-    }
+    const messageEl = el.createDiv({ cls: 'search-plus-filter-message' });
+    return { el, stateEl, fieldEl, operatorSelect, valueButton, messageEl, signature: '' };
   }
 
-  private renderValues(rowEl: HTMLElement, row: FilterRow): void {
-    const valuesEl = rowEl.createDiv({ cls: 'search-plus-filter-values' });
+  private updateRowView(view: RowView, row: FilterRow, force: boolean): void {
+    const validation = validateRow(row);
+    const noMatch = this.noMatchReason(row);
+    const property = this.options.catalog.getProperty(row.field);
+    const missing = row.values.filter((v) => this.options.catalog.valueCount(row.field, v) === 0);
+    const signature = JSON.stringify([
+      row.field,
+      row.operator,
+      row.values.map(scalarKey),
+      validation.status,
+      validation.status === 'active' ? '' : validation.message,
+      noMatch ?? '',
+      missing.map(scalarKey),
+      property?.caseVariants ?? [],
+    ]);
+    if (!force && signature === view.signature) return;
+    view.signature = signature;
+
+    const status = validation.status;
+    view.el.className = `search-plus-filter-row is-${status}${noMatch ? ' has-no-match' : ''}${
+      this.open?.kind === 'values' && this.open.rowId === row.id ? ' is-editing' : ''
+    }`;
+    view.el.dataset.field = row.field;
+    const message = status !== 'active' ? validation.message : noMatch;
+    const stateLabel = message ?? 'Filter is active';
+    view.stateEl.setAttribute('title', stateLabel);
+    view.el.setAttribute('title', message ?? '');
+
+    view.fieldEl.textContent = row.field;
+    view.fieldEl.setAttribute(
+      'title',
+      property?.caseVariants.length
+        ? `${row.field} (also used as ${property.caseVariants.join(', ')})`
+        : row.field,
+    );
+
+    view.operatorSelect.value = row.operator;
+    view.operatorSelect.setAttribute('aria-label', `Condition for ${row.field}`);
+
+    const needsValues = operatorNeedsValues(row.operator);
+    view.valueButton.toggle(needsValues);
+    view.valueButton.setAttribute('aria-label', `Select values for ${row.field}`);
+    view.valueButton.toggleClass('is-empty', row.values.length === 0);
+    view.valueButton.toggleClass('has-missing', missing.length > 0);
+    if (needsValues) {
+      const names = row.values.map(formatScalar);
+      view.valueButton.textContent = valueSummary(names);
+      view.valueButton.setAttribute('title', names.length > 0 ? names.join(', ') : 'Select values');
+    }
+
+    // Only blocking problems get a visible line; warnings live in the tooltip and color.
+    const visibleMessage = status === 'invalid' ? (validation.message ?? '') : '';
+    view.messageEl.textContent = visibleMessage;
+    view.messageEl.toggle(visibleMessage !== '');
+
+    const removeButton = view.el.querySelector('.search-plus-remove-filter');
+    removeButton?.setAttribute('aria-label', `Remove ${row.field} filter`);
+  }
+
+  /** Selected values of the open value popover, each removable, plus "Clear". */
+  private renderValueHeader(): void {
+    const open = this.open;
+    if (open?.kind !== 'values') return;
+    const row = this.findRow(open.rowId);
+    const header = open.headerEl;
+    header.empty();
+    if (!row) return;
+    const top = header.createDiv({ cls: 'search-plus-popover-summary' });
+    top.createSpan({
+      cls: 'search-plus-popover-count',
+      text: row.values.length === 0 ? 'No value selected' : `${row.values.length} selected`,
+    });
+    if (row.values.length > 0) {
+      const clear = top.createEl('button', {
+        cls: 'search-plus-clear-values clickable-icon',
+        text: 'Clear',
+        attr: { type: 'button', 'aria-label': `Clear values of ${row.field}` },
+      });
+      clear.addEventListener('click', () => {
+        this.options.store.clearValues(row.id);
+        open.list.focus();
+      });
+    }
+    if (row.values.length === 0) return;
+    const chips = header.createDiv({ cls: 'search-plus-filter-values' });
     for (const value of row.values) {
       const missing = this.options.catalog.valueCount(row.field, value) === 0;
-      const chip = valuesEl.createSpan({
+      const chip = chips.createSpan({
         cls: `search-plus-chip${missing ? ' is-missing' : ''}`,
-        attr: missing ? { title: 'No note has this value now' } : {},
+        attr: missing ? { title: 'No note has this value now' } : { title: formatScalar(value) },
       });
       chip.createSpan({ cls: 'search-plus-chip-label', text: formatScalar(value) });
       const type = scalarTypeLabel(value);
@@ -348,54 +508,15 @@ export class FilterBar {
         text: '×',
         attr: { type: 'button', 'aria-label': `Remove value ${formatScalar(value)}` },
       });
-      remove.addEventListener('click', () => this.options.store.toggleValue(row.id, value));
-    }
-    const addValue = valuesEl.createEl('button', {
-      cls: 'search-plus-add-value',
-      text: row.values.length === 0 ? 'Select value' : '+',
-      attr: { type: 'button', 'aria-label': `Select values for ${row.field}` },
-    });
-    addValue.addEventListener('click', () => {
-      if (this.open?.kind === 'values' && this.open.rowId === row.id) this.closePopover();
-      else this.openValues(row.id);
-    });
-    if (row.values.length > 1) {
-      const clear = valuesEl.createEl('button', {
-        cls: 'search-plus-clear-values mod-muted',
-        text: 'Clear',
-        attr: { type: 'button', 'aria-label': `Clear values of ${row.field}` },
+      remove.addEventListener('click', () => {
+        this.options.store.toggleValue(row.id, value);
+        open.list.focus();
       });
-      clear.addEventListener('click', () => this.options.store.clearValues(row.id));
     }
   }
 
-  private renderValueList(host: HTMLElement, row: FilterRow, query: string, active: number): void {
-    const hint = this.getHint(row.field);
-    this.list = new SearchableList(host, {
-      placeholder: `Find ${row.field} values...`,
-      emptyText: 'No values yet. Type a value to use it.',
-      ariaLabel: `Values of ${row.field}`,
-      keepOpenOnChoose: true,
-      initialQuery: query,
-      initialActive: active,
-      load: (q) => {
-        const current = this.options.store.getRows().find((r) => r.id === row.id) ?? row;
-        this.valuePage = buildValuePage(this.options.catalog, current, q, hint);
-        return this.valuePage;
-      },
-      onChoose: (item) => {
-        const value = this.valuePage?.valueById.get(item.id);
-        if (value === undefined) return;
-        this.options.store.toggleValue(row.id, value);
-      },
-      onClose: () => {
-        this.closePopover();
-        const rowEl = Array.from(this.rowsEl.children).find(
-          (el) => (el as HTMLElement).dataset.rowId === row.id,
-        );
-        rowEl?.querySelector<HTMLElement>('.search-plus-add-value')?.focus();
-      },
-    });
+  private updateFooterVisibility(): void {
+    this.footerEl.toggle(!!this.statusEl.textContent || !!this.actionHandler);
   }
 
   /** Client-side hint from the catalog; the engine still decides the real matches. */
@@ -423,7 +544,7 @@ export class FilterBar {
       .getHint(field, this.options.catalog.samplePathsWithField(field, 5))
       .then((hint) => {
         this.hints.set(field, hint);
-        if (hint.options.length > 0 && this.open?.kind === 'values') this.render();
+        if (hint.options.length > 0 && this.open?.kind === 'values') this.open.list.refresh();
       })
       .catch(() => {});
     return null;
@@ -446,23 +567,13 @@ export class FilterBar {
     // Always consumes Escape (false = handled + preventDefault in Obsidian scopes).
     // eslint-disable-next-line sonarjs/no-invariant-returns -- see above
     scope.register([], 'Escape', (evt: KeyboardEvent) => {
-      if (handledListEvents.has(evt) || this.closePopover()) {
-        this.options.focusSearch?.();
-        return false;
-      }
+      if (handledListEvents.has(evt)) return false;
+      if (this.closePopover(true)) return false;
       config.onEscape();
       return false;
     });
     this.scope = scope;
-    const onFocusIn = () => this.pushScope();
-    const onFocusOut = (evt: FocusEvent) => {
-      if (this.rendering) return;
-      const next = evt.relatedTarget as Node | null;
-      if (next && this.el.contains(next)) return;
-      this.popScope();
-    };
-    this.el.addEventListener('focusin', onFocusIn);
-    this.el.addEventListener('focusout', onFocusOut);
+    this.el.addEventListener('focusin', () => this.pushScope());
   }
 
   private pushScope(): void {
@@ -476,4 +587,11 @@ export class FilterBar {
     this.options.app.keymap?.popScope(this.scope);
     this.scopePushed = false;
   }
+}
+
+/** Row text for selected values: "Select value", up to two names, or a count. */
+function valueSummary(names: string[]): string {
+  if (names.length === 0) return 'Select value';
+  if (names.length <= NAMED_VALUES) return names.join(', ');
+  return `${names.length} selected`;
 }

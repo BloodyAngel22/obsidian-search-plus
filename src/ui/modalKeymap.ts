@@ -1,6 +1,7 @@
 import { App, TFile } from 'obsidian';
 import type { SearchResult } from '../ipc';
 import type { HybridSearchSettings } from '../settings';
+import { openResultAtAnchor } from './navigation/openResult';
 import { fileToDragWikiLink } from './noteUtils';
 import type { SearchModal } from './SearchModal';
 
@@ -28,6 +29,14 @@ export function registerModalKeymap(
   function getAll(m: SearchModal): SearchResult[] {
     const chooser = (m as unknown as ModalWithChooser).chooser;
     return (chooser?.values ?? []) as SearchResult[];
+  }
+
+  /** New tab first, then open and move to the result's passage inside that tab. */
+  function openInNewTab(result: SearchResult): void {
+    const file = app.vault.getAbstractFileByPath(result.path.normalize('NFC'));
+    if (!(file instanceof TFile)) return;
+    const leaf = app.workspace.getLeaf('tab');
+    void openResultAtAnchor(app, leaf, file, result, modal.getNavigationOptions?.() ?? {});
   }
 
   // ── Navigation ────────────────────────────────────────────────────────────
@@ -103,11 +112,7 @@ export function registerModalKeymap(
   modal.scope.register(['Mod'], 'o', (_evt: KeyboardEvent) => {
     const result = getSelected(modal);
     if (!result) return;
-    const file = app.vault.getAbstractFileByPath(result.path.normalize('NFC'));
-    if (file instanceof TFile) {
-      // @ts-ignore — 'tab' is a valid PaneType in modern Obsidian
-      void app.workspace.getLeaf('tab').openFile(file);
-    }
+    openInNewTab(result);
   });
 
   // ── Open all in new tabs ──────────────────────────────────────────────────
@@ -115,13 +120,7 @@ export function registerModalKeymap(
   modal.scope.register(['Mod', 'Shift'], 'o', (_evt: KeyboardEvent) => {
     const results = getAll(modal);
     if (results.length === 0) return;
-    for (const r of results) {
-      const file = app.vault.getAbstractFileByPath(r.path.normalize('NFC'));
-      if (file instanceof TFile) {
-        // @ts-ignore — 'tab' is a valid PaneType in modern Obsidian
-        void app.workspace.getLeaf('tab').openFile(file);
-      }
-    }
+    for (const r of results) openInNewTab(r);
     modal.close();
   });
 

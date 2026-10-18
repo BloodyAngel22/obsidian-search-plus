@@ -119,16 +119,26 @@ zettelkasten #project @limit:20 @rerank @hybrid
 Both the search modal and the search panel have a compact filter bar under the search field: a mode dropdown and **+ Filter**.
 
 1. Select **+ Filter** and type to find a property. The list shows the YAML properties used in this vault (read from Obsidian's metadata cache) with note counts.
-2. Pick a property. A filter row appears and its value list opens. Select one or more values (they are combined with OR), or type a value that no note has yet and press Enter.
+2. Pick a property. A one-line filter row appears (property, condition, values, ×) and a value list opens over the results. Select one or more values (they are combined with OR), or type a value that no note has yet and press Enter. The list shows the selected values at the top; remove one with × or all with **Clear**.
 3. Change the condition with the dropdown: **is any of**, **is none of**, **exists**, **is missing**.
+
+The row shows up to two values by name and a count for more (`5 selected`); hover it to see all values. Lists work with the keyboard: arrows, Enter, Escape (focus returns to the row), and a click outside closes them. In a narrow side panel the values move to a second line.
 
 Rows for different properties are combined with AND, and with any operators typed in the query (for example `status:done #pkm`). Filters apply inside the engine before the result limit, in every search mode. With filters and an empty query, the search lists all matching notes with an exact count and a **Load more** button.
 
-A row with a dashed border is incomplete (no value yet) and does not restrict results. A row marked in orange has values no note currently uses; the values stay selected until you remove them. Filters are saved and shared between the modal and the panel.
+The dot before a row shows its state: filled means active, hollow means incomplete (no value yet, does not restrict results), orange means no note currently uses the selected values (they stay selected until you remove them), red means invalid. Hover the row for the reason. Filters are saved and shared between the modal and the panel.
 
 Values are typed like in YAML: `1` (number) and `"1"` (text) are different values. Only YAML frontmatter is used; inline `key:: value` fields are not filterable. Metadata Menu is optional: when it is installed, its Select/Multi/Boolean field definitions add value suggestions, but matching always uses the YAML values the engine indexed.
 
 Metadata filters need an engine that reports the `structuredFiltersV1` capability (`ohs capabilities`). With an older engine the plugin shows an "engine update needed" message instead of unfiltered results.
+
+## Opening results
+
+Opening a result (Enter, a click, or `Mod+O` for a new tab) jumps to the passage that matched, not to the top of the note. Result rows show the heading path and a short snippet of that passage; full-text matches mark the query words.
+
+- In Source mode and Live Preview the cursor is placed at the passage. For full-text matches the matched word is selected.
+- In Reading view the note scrolls to the passage and the block is highlighted for a moment. The note stays in Reading view.
+- The plugin checks the engine's position against the current note text. If the note changed, it looks for the passage inside the same heading section and accepts it only when there is exactly one match. If the passage cannot be verified (or for title and metadata-only results), the note opens normally.
 
 ## Hotkeys
 

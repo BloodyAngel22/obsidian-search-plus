@@ -71,11 +71,14 @@ describe('SearchPanelView', () => {
     const view = new SearchPanelView(panelLeaf, plugin as never);
 
     (
-      view as unknown as { openResultFromPanel: (path: string, newLeaf: boolean) => void }
-    ).openResultFromPanel('target.md', false);
+      view as unknown as {
+        openResultFromPanel: (result: SearchResult, newLeaf: boolean) => void;
+      }
+    ).openResultFromPanel(result, false);
 
     expect(panelLeaf.openFile).not.toHaveBeenCalled();
-    expect(markdownLeaf.openFile).toHaveBeenCalledWith(file, undefined);
+    // No anchor: the note opens normally, without a jump target.
+    expect(markdownLeaf.openFile).toHaveBeenCalledWith(file, { active: true });
   });
 
   it('colors relevance scores like the modal', async () => {
@@ -565,19 +568,8 @@ describe('SearchPanelView', () => {
       ?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     await new Promise((resolve) => window.setTimeout(resolve, 0));
 
-    expect(openFile).toHaveBeenCalledWith(
-      file,
-      expect.objectContaining({
-        active: true,
-        eState: expect.objectContaining({
-          line: 1,
-          cursor: {
-            from: { line: 1, ch: 0 },
-            to: { line: 1, ch: 13 },
-          },
-        }),
-      }),
-    );
+    // The chunk is not selected; the leaf gets a line hint for the verified passage.
+    expect(openFile).toHaveBeenCalledWith(file, { active: true, eState: { line: 1 } });
   });
 
   it('falls back to match text when a snippet anchor offset is stale', async () => {
@@ -625,15 +617,8 @@ describe('SearchPanelView', () => {
       ?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     await new Promise((resolve) => window.setTimeout(resolve, 0));
 
-    expect(openFile).toHaveBeenCalledWith(
-      file,
-      expect.objectContaining({
-        eState: expect.objectContaining({
-          line: 1,
-          cursor: expect.objectContaining({ from: { line: 1, ch: 7 } }),
-        }),
-      }),
-    );
+    // The offset is stale, but the anchor text is unique in the note.
+    expect(openFile).toHaveBeenCalledWith(file, { active: true, eState: { line: 1 } });
   });
 
   it('keeps snippet anchors for modifier-clicks and keyboard activation', async () => {
@@ -697,6 +682,64 @@ describe('SearchPanelView', () => {
         eState: expect.objectContaining({ line: 1 }),
       }),
     );
+  });
+
+  it('opens normal rows at their anchor with Enter, click and Mod+O', async () => {
+    const anchoredResult: SearchResult = {
+      ...result,
+      previewAnchors: [
+        {
+          kind: 'semantic',
+          headingPath: '## Part',
+          matchText: 'target phrase in the second part',
+          charStart: null,
+          charEnd: null,
+        },
+      ],
+      primaryAnchorIndex: 0,
+    };
+    const tabOpenFile = vi.fn().mockResolvedValue(undefined);
+    const markdownOpenFile = vi.fn().mockResolvedValue(undefined);
+    const file = Object.assign(new TFile(), { path: 'target.md' });
+    const app = {
+      workspace: {
+        getActiveFile: () => null,
+        getLeavesOfType: () => [{ openFile: markdownOpenFile }],
+        getLeaf: vi.fn(() => ({ openFile: tabOpenFile })),
+      },
+      vault: {
+        cachedRead: vi
+          .fn()
+          .mockResolvedValue('---\na: 1\n---\n## Part\n\ntarget phrase in the second part\n'),
+        getAbstractFileByPath: () => file,
+      },
+      metadataCache: { getCache: () => null },
+    };
+    const leaf = Object.assign(new WorkspaceLeaf(), { app });
+    const plugin = {
+      manifest: { id: 'hybrid-search' },
+      app,
+      settings: { ...DEFAULT_SETTINGS },
+      client: { search: vi.fn().mockResolvedValue([anchoredResult]) },
+    };
+    const view = new SearchPanelView(leaf, plugin as never);
+    await view.onOpen();
+    await (view as unknown as { search: (query: string) => Promise<void> }).search('target');
+    expect(view.containerEl.querySelector('.hybrid-search-panel-heading')?.textContent).toBe(
+      'Part',
+    );
+
+    const input = view.containerEl.querySelector<HTMLInputElement>('.hybrid-search-panel-input')!;
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    await vi.waitFor(() =>
+      expect(markdownOpenFile).toHaveBeenCalledWith(file, { active: true, eState: { line: 5 } }),
+    );
+
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'o', ctrlKey: true, bubbles: true }));
+    await vi.waitFor(() =>
+      expect(tabOpenFile).toHaveBeenCalledWith(file, { active: true, eState: { line: 5 } }),
+    );
+    expect(app.workspace.getLeaf).toHaveBeenCalledWith('tab');
   });
 
   it('applies gear option limit and threshold unless the query overrides them', async () => {

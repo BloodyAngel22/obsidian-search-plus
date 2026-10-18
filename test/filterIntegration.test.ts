@@ -312,3 +312,77 @@ describe('SearchPanelView with metadata filters', () => {
     await view.onClose();
   });
 });
+
+describe('Compact filter UI shared by the modal and the panel', () => {
+  it('a value picked in the modal popover shows in the panel and gives both the same filters', async () => {
+    vi.useFakeTimers();
+    const shared = services();
+    const modalClient = modernClient();
+    const modal = new SearchModal(
+      modalApp() as never,
+      modalClient as never,
+      { ...DEFAULT_SETTINGS },
+      vi.fn(),
+      { filters: shared },
+    );
+    attachModalDom(modal);
+    modal.open();
+
+    const panelClient = modernClient();
+    const app = {
+      workspace: {
+        getActiveFile: () => null,
+        getLeavesOfType: () => [],
+        getLeaf: () => ({ openFile: vi.fn() }),
+      },
+      vault: { getAbstractFileByPath: () => null },
+      metadataCache: { getCache: () => null },
+      keymap: { pushScope: vi.fn(), popScope: vi.fn() },
+    };
+    const leaf = Object.assign(new WorkspaceLeaf(), { app });
+    const view = new SearchPanelView(leaf, {
+      manifest: { id: 'hybrid-search' },
+      app,
+      settings: { ...DEFAULT_SETTINGS },
+      client: panelClient,
+      filterServices: shared,
+      saveSettings: vi.fn(),
+    } as never);
+    await view.onOpen();
+
+    const modalEl = (modal as unknown as { modalEl: HTMLElement }).modalEl;
+    modalEl.querySelector<HTMLButtonElement>('.search-plus-add-filter')!.click();
+    const picker = activeDocument.querySelector<HTMLInputElement>(
+      '.search-plus-floating-popover .search-plus-popover-input',
+    )!;
+    picker.value = 'projects';
+    picker.dispatchEvent(new Event('input'));
+    picker.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    activeDocument
+      .querySelector<HTMLElement>('.search-plus-floating-popover .search-plus-popover-item')!
+      .click();
+    expect(shared.store.getRows()).toEqual([
+      expect.objectContaining({ field: 'projects', operator: 'IN', values: ['alpha'] }),
+    ]);
+    expect(view.containerEl.querySelector('.search-plus-filter-value')!.textContent).toBe('alpha');
+
+    // The mock SuggestModal does not re-query on input events; run the query directly.
+    const pending = modal.getSuggestions('');
+    await vi.advanceTimersByTimeAsync(400);
+    await pending;
+    await flush();
+    const modalFilters = modalClient.searchWithMeta.mock.lastCall?.[1]?.filters;
+    const panelFilters = panelClient.searchWithMeta.mock.lastCall?.[1]?.filters;
+    expect(modalFilters).toEqual({
+      version: 1,
+      operator: 'AND',
+      conditions: [{ field: 'projects', operator: 'IN', values: ['alpha'] }],
+    });
+    expect(panelFilters).toEqual(modalFilters);
+
+    modal.onClose();
+    await view.onClose();
+    expect(activeDocument.querySelector('.search-plus-floating-popover')).toBeNull();
+    vi.useRealTimers();
+  });
+});

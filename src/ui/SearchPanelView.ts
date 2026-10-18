@@ -7,16 +7,14 @@ import type { SearchMeta, SearchResult } from '../ipc';
 import type HybridSearchPlugin from '../main';
 import { FilterBar } from './filters/FilterBar';
 import { describeResults } from './filters/resultStatus';
+import { openResultAtAnchor, type OpenResultOptions } from './navigation/openResult';
+import { getResultContext } from './navigation/resultContext';
 import {
   createInternalLink,
   fileToDragWikiLink,
-  getAnchorOffset,
-  getPrimaryAnchor,
   getResultTitle,
   hookSuperchargedLinks,
   modeLabel,
-  offsetToEditorPosition,
-  openResult,
   resolveSimilarTarget,
   scoreColor,
   unhookSuperchargedLinks,
@@ -55,6 +53,8 @@ export class SearchPanelView extends ItemView {
   private hideScores = false;
   /** Current metadata-only request and its paging state, for "Load more". */
   private metadataPaging?: { request: SearchRequest; meta?: SearchMeta };
+  /** Mode and query words of the results on screen, for opening them at their passage. */
+  private openOptions: OpenResultOptions = {};
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -263,6 +263,7 @@ export class SearchPanelView extends ItemView {
       return;
     }
     this.hideScores = request.kind === 'metadata';
+    this.openOptions = { mode: request.mode, queryWords: request.queryWords };
     this.results = [...outcome.results].sort((a, b) => b.score - a.score);
     this.selectedIndex = this.results.length > 0 ? 0 : -1;
     if (request.kind === 'metadata') {
@@ -340,6 +341,14 @@ export class SearchPanelView extends ItemView {
         });
         scoreEl.style.color = scoreColor(result.score);
       }
+      const heading = getResultContext(result).heading;
+      if (heading) {
+        item.createDiv({
+          cls: 'search-plus-result-heading hybrid-search-panel-heading',
+          text: heading,
+          attr: { title: heading },
+        });
+      }
       if (this.plugin.settings.showMeta) {
         const folder = result.path.includes('/') ? result.path.replace(/\/[^/]+$/, '') : '';
         if (folder) item.createDiv({ cls: 'hybrid-search-panel-meta', text: folder });
@@ -377,7 +386,7 @@ export class SearchPanelView extends ItemView {
       mouseEvt.stopPropagation();
       const result = this.results[Number(snippet.dataset.index)];
       if (result) {
-        void this.openResultFromPanel(result.path, mouseEvt.ctrlKey || mouseEvt.metaKey, result);
+        void this.openResultFromPanel(result, mouseEvt.ctrlKey || mouseEvt.metaKey);
       }
       return;
     }
@@ -394,7 +403,7 @@ export class SearchPanelView extends ItemView {
     const result = this.results[index];
     if (!result) return;
     mouseEvt.preventDefault();
-    void this.openResultFromPanel(result.path, mouseEvt.ctrlKey || mouseEvt.metaKey);
+    void this.openResultFromPanel(result, mouseEvt.ctrlKey || mouseEvt.metaKey);
   }
 
   private handleHoverPreview(evt: Event): void {
@@ -425,7 +434,7 @@ export class SearchPanelView extends ItemView {
       const result = this.results[Number(snippet.dataset.index)];
       if (!result) return;
       evt.preventDefault();
-      void this.openResultFromPanel(result.path, evt.ctrlKey || evt.metaKey, result);
+      void this.openResultFromPanel(result, evt.ctrlKey || evt.metaKey);
       return;
     }
     if ((evt.ctrlKey || evt.metaKey) && !evt.altKey && !evt.shiftKey && evt.key === 'j') {
@@ -467,7 +476,7 @@ export class SearchPanelView extends ItemView {
       const result = this.results[this.selectedIndex];
       if (!result) return;
       evt.preventDefault();
-      void this.openResultFromPanel(result.path, evt.ctrlKey || evt.metaKey);
+      void this.openResultFromPanel(result, evt.ctrlKey || evt.metaKey);
       return;
     }
     if (evt.key === 'Escape') {
@@ -502,11 +511,11 @@ export class SearchPanelView extends ItemView {
 
   private openSelectedInNewTab(): void {
     const result = this.results[this.selectedIndex];
-    if (result) openResult(this.app, result.path, true);
+    if (result) void this.openResultFromPanel(result, true);
   }
 
   private openAllResultsInNewTabs(): void {
-    for (const result of this.results) openResult(this.app, result.path, true);
+    for (const result of this.results) void this.openResultFromPanel(result, true);
   }
 
   private insertSelectedLinkAtCursor(): void {
@@ -665,48 +674,22 @@ export class SearchPanelView extends ItemView {
     this.modeEl.setAttribute('title', this.similarPath ? 'Similar notes' : `Search mode: ${mode}`);
   }
 
-  private async openResultFromPanel(
-    path: string,
-    newLeaf: boolean,
-    result?: SearchResult,
-  ): Promise<void> {
-    const nfcPath = path.normalize('NFC');
+  /**
+   * Open a result at its most relevant passage. The target leaf is chosen first (a
+   * markdown leaf other than the panel, or a new tab) and navigation happens inside it.
+   */
+  private async openResultFromPanel(result: SearchResult, newLeaf: boolean): Promise<void> {
+    const nfcPath = result.path.normalize('NFC');
     const abstract = this.app.vault.getAbstractFileByPath(nfcPath);
     if (!(abstract instanceof TFile)) return;
     const target = newLeaf
       ? this.app.workspace.getLeaf('tab')
       : (this.app.workspace.getLeavesOfType('markdown').find((leaf) => leaf !== this.leaf) ??
         this.app.workspace.getLeaf('tab'));
-    const openState = result ? await this.getSnippetOpenState(abstract, result) : undefined;
-    void target.openFile(abstract, openState);
-  }
-
-  private async getSnippetOpenState(
-    file: TFile,
-    result: SearchResult,
-  ): Promise<Parameters<WorkspaceLeaf['openFile']>[1] | undefined> {
-    const anchor = getPrimaryAnchor(result);
-    if (!anchor) return undefined;
-    try {
-      const content = await this.app.vault.cachedRead(file);
-      const startOffset = getAnchorOffset(content, anchor);
-      if (startOffset < 0) return undefined;
-      const endOffset =
-        typeof anchor.charEnd === 'number' && anchor.charEnd >= startOffset
-          ? anchor.charEnd
-          : startOffset;
-      const from = offsetToEditorPosition(content, startOffset);
-      const to = offsetToEditorPosition(content, endOffset);
-      return {
-        active: true,
-        eState: {
-          line: from.line,
-          cursor: { from, to },
-        },
-      };
-    } catch {
-      return undefined;
-    }
+    await openResultAtAnchor(this.app, target, abstract, result, {
+      ...this.openOptions,
+      active: true,
+    });
   }
 }
 
